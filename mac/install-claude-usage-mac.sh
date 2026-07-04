@@ -140,7 +140,8 @@ else
     echo "!! node NOT found — install it:  brew install node"
 fi
 
-if [ -f "$HOME/.claude/.credentials.json" ]; then
+# On macOS the token lives in the Keychain, not the file — check both.
+if [ -f "$HOME/.claude/.credentials.json" ] || security find-generic-password -s 'Claude Code-credentials' -w >/dev/null 2>&1; then
     echo "• Claude Code login: found"
 else
     echo "!! Not logged in to Claude Code on this Mac — run 'claude' once and sign in."
