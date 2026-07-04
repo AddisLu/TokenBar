@@ -1,54 +1,63 @@
-# claude-usage-mac-plugin
+# tokenbar
 
-A [SwiftBar](https://github.com/swiftbar/SwiftBar) menu-bar plugin that shows **real
-Claude usage** — session (5h) and weekly limits with reset countdowns — pulled from
-Anthropic's official `oauth/usage` endpoint (the same data as Claude Code's `/usage`).
+Show your **real Claude usage** — session (5h) and weekly limits with reset
+countdowns — right in your OS status bar, on **macOS, Linux, and Windows**.
 
-It draws a compact graphical progress bar in the macOS menu bar, matching the look of
-the Linux GNOME version:
+The data comes from Anthropic's official `oauth/usage` endpoint — the same source
+as Claude Code's `/usage` command — so the percentages and reset times are the
+real, server-side numbers (not an estimate from local logs). Because that endpoint
+is **account-level**, every device shows the same combined usage; no syncing needed.
 
 ```
-◐◐░  27% 1:17 · W 10%
+◉  27% 1:17  ·  W 10%          ← session bar + reset countdown, weekly bar
 ```
 
-## Install (macOS)
+## What it shows
+- **Session (5h)** utilization % + exact reset time (the window that resets often)
+- **Weekly** utilization % + reset time
+- A compact two-segment progress bar, colored green → orange → red
 
+## Platforms
+
+| OS | Tech | Folder |
+|----|------|--------|
+| macOS | [SwiftBar](https://github.com/swiftbar/SwiftBar) menu-bar plugin | [`mac/`](mac/) |
+| Linux | GNOME Shell top-bar extension | [`linux/`](linux/) |
+| Windows | System-tray indicator (PowerShell) | [`windows/`](windows/) |
+
+All three share the same behaviour, including **rate-limit resilience**: they cache
+the last good result and keep drawing the bar (countdowns recomputed live) when the
+endpoint returns 429 / errors, and skip the API when the last success was very recent.
+
+### macOS
 ```bash
-bash install-claude-usage-mac.sh
+cd mac && bash install-claude-usage-mac.sh
 ```
+Installs the SwiftBar plugin (`claude-usage.120s.sh`, refresh every 120 s), adds
+SwiftBar to Login Items, and refreshes. Prereqs: `brew install node`,
+`brew install --cask swiftbar`, and signed in to Claude Code once (token read from
+the macOS Keychain item `Claude Code-credentials`).
 
-The installer:
-- writes `claude-usage.60s.sh` into SwiftBar's plugin folder,
-- checks prerequisites (Node.js, SwiftBar, Claude Code login),
-- adds SwiftBar to Login Items and refreshes it.
+### Linux (GNOME)
+```bash
+cd linux && bash install-linux.sh
+```
+Installs + enables the GNOME extension, then reload the shell (X11: `Alt+F2` → `r` →
+Enter; Wayland: log out/in). Prereqs: Node.js and signed in to Claude Code (token
+read from `~/.claude/.credentials.json`).
 
-**Prerequisites**
-- `brew install node`
-- `brew install --cask swiftbar`
-- Signed in to Claude Code once on this Mac (token is read from the macOS Keychain
-  item `Claude Code-credentials`, or `~/.claude/.credentials.json` on Linux).
-
-## Install (Windows)
-
-Windows has no menu bar, so the same bar is shown as a **system-tray icon**
-(top segment = session, bottom = weekly; hover for %/reset, right-click to
-Refresh/Quit). Pure PowerShell — no Node or extra install needed.
-
+### Windows
 ```powershell
-powershell -ExecutionPolicy Bypass -File windows\install-claude-usage-windows.ps1
+cd windows
+powershell -ExecutionPolicy Bypass -File install-claude-usage-windows.ps1
 ```
+Installs a system-tray indicator that launches hidden at login. Prereqs: Node.js and
+signed in to Claude Code (token read from `%USERPROFILE%\.claude\.credentials.json`).
 
-The installer copies the tray app to `%LOCALAPPDATA%\ClaudeUsageBar`, makes it
-launch hidden at login, and starts it. Credentials are read from
-`%USERPROFILE%\.claude\.credentials.json` (sign in to Claude Code once first).
-
-## Files
-- `claude-usage.60s.sh` — the macOS SwiftBar plugin (source of truth for the design).
-- `install-claude-usage-mac.sh` — one-shot macOS installer; embeds a copy of the plugin.
-- `windows/claude-usage-tray.ps1` — the Windows system-tray indicator (same data + design).
-- `windows/install-claude-usage-windows.ps1` — one-shot Windows installer.
-
-All three read the same `oauth/usage` endpoint and share the same look, colours,
-and rate-limit resilience (cache last-good result + 50s throttle guard).
-
-> Every version only **reads** the credentials file / Keychain; it never writes them back.
+## Notes
+- **Read-only**: every version only *reads* the credentials file / Keychain — it
+  never writes them back, so it can't rotate your token or log you out. If the token
+  expires, run Claude Code once to refresh it.
+- The `oauth/usage` endpoint is unofficial/internal (it's what Claude Code's `/usage`
+  uses); Anthropic may change it.
+- The session/weekly limits shown apply to Max/Pro subscription accounts.

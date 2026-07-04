@@ -21,7 +21,8 @@ else
     echo "• Plugin folder: $PLUGDIR (from SwiftBar prefs)"
 fi
 
-PLUGIN="$PLUGDIR/claude-usage.60s.sh"
+PLUGIN="$PLUGDIR/claude-usage.120s.sh"
+rm -f "$PLUGDIR/claude-usage.60s.sh"   # drop older-interval copy so we don't run two
 
 # --- 1. write the plugin ---
 cat > "$PLUGIN" <<'PLUGIN_EOF'
