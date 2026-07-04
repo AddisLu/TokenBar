@@ -1,0 +1,8 @@
+{
+  "uuid": "claude-usage-bar@addis.local",
+  "name": "Claude Usage Bar",
+  "description": "Top-bar token bar for Claude Code: shows current 5-hour block usage and reset countdown (Max plan). Reads local logs via ccusage.",
+  "shell-version": ["45", "46", "47"],
+  "version": 1,
+  "url": "https://github.com/local/claude-usage-bar"
+}

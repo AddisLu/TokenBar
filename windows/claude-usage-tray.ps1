@@ -1,7 +1,7 @@
 <#
   Claude Usage — Windows system-tray indicator
   ------------------------------------------------------------------
-  Windows counterpart of the macOS SwiftBar plugin (claude-usage.60s.sh).
+  Windows counterpart of the macOS SwiftBar plugin (claude-usage.180s.sh).
   Shows REAL Claude usage from Anthropic's official oauth/usage endpoint
   (same data as Claude Code's /usage): session (5h) + weekly, with reset
   countdowns. Draws the same two-segment progress bar as a tray icon;
@@ -222,7 +222,7 @@ $miQuit.add_Click({
 })
 
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 60000   # 60s, matches the Mac plugin's .60s cadence
+$timer.Interval = 180000  # 180s, matches the other platforms
 $timer.add_Tick({ Update-Bar })
 $timer.Start()
 
