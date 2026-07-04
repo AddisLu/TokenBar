@@ -3,6 +3,9 @@
 # Reads the OAuth token from ~/.claude/.credentials.json (Linux) or the macOS
 # Keychain (item "Claude Code-credentials"). Read-only; never writes it back.
 # Draws a graphical progress bar (PNG) to match the Linux GNOME version.
+# Resilient to the endpoint's tight rate limit: caches the last good result and
+# keeps drawing the bar (countdowns recomputed live) when the API returns 429 /
+# errors, and skips the API entirely if the last success was <50s ago.
 # <bitbar.title>Claude Usage</bitbar.title>
 # <bitbar.desc>Real Claude session + weekly usage and reset (Max/Pro)</bitbar.desc>
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -14,9 +17,16 @@ CREDS="$(cat "$HOME/.claude/.credentials.json" 2>/dev/null)"
 
 CLAUDE_CREDS="$CREDS" "$NODE" --input-type=module <<'JS'
 import zlib from 'node:zlib';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 process.stdout.on('error', () => process.exit(0));
 const line = (s) => process.stdout.write(s + '\n');
 const bad = (m) => { line('○ Claude'); line('---'); line(m); process.exit(0); };
+
+const CACHE = path.join(os.homedir(), '.cache', 'claude-usage-bar.json');
+const readCache = () => { try { return JSON.parse(fs.readFileSync(CACHE, 'utf8')); } catch { return null; } };
+const writeCache = (o) => { try { fs.mkdirSync(path.dirname(CACHE), {recursive:true}); fs.writeFileSync(CACHE, JSON.stringify(o)); } catch {} };
 
 let tok, sub;
 try { const c = JSON.parse(process.env.CLAUDE_CREDS || '').claudeAiOauth; tok = c.accessToken; sub = c.subscriptionType; }
@@ -42,29 +52,52 @@ function barsPNG(sPct,sCol,wPct,wCol){
   return png(W0,H0,out).toString('base64');}
 const GREEN=[46,194,126],ORANGE=[255,120,0],RED=[224,27,36];
 const rgb=(p,sev)=>(sev==='critical'||p>=90)?RED:(sev==='warning'||p>=70)?ORANGE:GREEN;
+const cd=(iso)=>{if(!iso)return 'n/a';let ms=new Date(iso)-Date.now();if(ms<=0)return 'now';const m=Math.floor(ms/60000),h=Math.floor(m/60);return h>0?`${h}:${String(m%60).padStart(2,'0')}`:`${m}m`;};
+const clock=(iso)=>iso?new Date(iso).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'}):'n/a';
+
+// Draw the menu bar + dropdown from S/W. Countdowns are recomputed live, so even
+// a cached S/W shows an accurate reset timer. `note` (optional) is shown dimmed
+// in the dropdown to explain a stale/fallback state.
+function render(S, W, note){
+  const sp=Math.round(S?.percent??0), wp=Math.round(W?.percent??0);
+  const b64=barsPNG(sp,rgb(sp,S?.severity),wp,rgb(wp,W?.severity));
+  line(`${sp}% ${cd(S?.resets_at)}  ·  W ${wp}% | image=${b64}`);
+  line('---');
+  line(`Claude${sub?' — '+sub:''}`);
+  if (note) line(`${note} | color=orange`);
+  line(`Session (5h): ${sp}%   resets ${clock(S?.resets_at)} (in ${cd(S?.resets_at)})`);
+  line(`Weekly: ${wp}%   resets ${clock(W?.resets_at)} (in ${cd(W?.resets_at)})`);
+  line('---');
+  line('Refresh | refresh=true');
+  process.exit(0);
+}
+const staleNote = (ts) => `⚠ API throttled — cached ${Math.round((Date.now()-ts)/1000)}s ago`;
+
+const cache = readCache();
+// Throttle guard: if we fetched successfully <50s ago, reuse it and don't hit the API.
+if (cache && Date.now()-cache.ts < 50_000) render(cache.S, cache.W);
 
 try {
   const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
     headers: {Authorization:`Bearer ${tok}`,'anthropic-beta':'oauth-2025-04-20','anthropic-version':'2023-06-01','Accept':'application/json','User-Agent':'claude-cli/usage-bar'},
     signal: AbortSignal.timeout(15000),
   });
-  if (res.status===401||res.status===403) bad('Token expired — run Claude Code once');
-  if (!res.ok) bad('HTTP '+res.status);
+  if (res.status===401||res.status===403) {
+    if (cache) render(cache.S, cache.W, '⚠ Token expired — run Claude Code once');
+    bad('Token expired — run Claude Code once');
+  }
+  if (!res.ok) {
+    if (cache) render(cache.S, cache.W, staleNote(cache.ts));
+    bad('HTTP '+res.status);
+  }
   const d = await res.json();
   const lim = Array.isArray(d.limits)?d.limits:[];
   const S = lim.find(l=>l.kind==='session') || (d.five_hour&&{percent:d.five_hour.utilization,resets_at:d.five_hour.resets_at,severity:'normal'});
   const W = lim.find(l=>l.kind==='weekly_all') || (d.seven_day&&{percent:d.seven_day.utilization,resets_at:d.seven_day.resets_at,severity:'normal'});
-  const cd=(iso)=>{if(!iso)return 'n/a';let ms=new Date(iso)-Date.now();if(ms<=0)return 'now';const m=Math.floor(ms/60000),h=Math.floor(m/60);return h>0?`${h}:${String(m%60).padStart(2,'0')}`:`${m}m`;};
-  const clock=(iso)=>iso?new Date(iso).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'}):'n/a';
-  const sp=Math.round(S?.percent??0),wp=Math.round(W?.percent??0);
-  const b64=barsPNG(sp,rgb(sp,S?.severity),wp,rgb(wp,W?.severity));
-  // menu bar: graphical bars (image) + readable numbers (text)
-  line(`${sp}% ${cd(S?.resets_at)}  ·  W ${wp}% | image=${b64}`);
-  line('---');
-  line(`Claude${sub?' — '+sub:''}`);
-  line(`Session (5h): ${sp}%   resets ${clock(S?.resets_at)} (in ${cd(S?.resets_at)})`);
-  line(`Weekly: ${wp}%   resets ${clock(W?.resets_at)} (in ${cd(W?.resets_at)})`);
-  line('---');
-  line('Refresh | refresh=true');
-} catch(e) { bad('Network error'); }
+  writeCache({sub, S, W, ts: Date.now()});
+  render(S, W);
+} catch(e) {
+  if (cache) render(cache.S, cache.W, staleNote(cache.ts));
+  bad('Network error');
+}
 JS
