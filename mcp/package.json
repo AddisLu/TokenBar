@@ -1,0 +1,8 @@
+{
+  "name": "claude-usage-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing real Claude usage (session + weekly) from Anthropic's oauth/usage endpoint",
+  "type": "module",
+  "bin": { "claude-usage-mcp": "server.mjs" },
+  "dependencies": { "@modelcontextprotocol/sdk": "^1.0.0" }
+}
