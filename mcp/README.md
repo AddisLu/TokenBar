@@ -1,20 +1,22 @@
 # claude-usage MCP server
 
 An [MCP](https://modelcontextprotocol.io) server that exposes your **real Claude
-usage** as a tool, so any MCP client (Claude Code, Claude Desktop) can just *ask*
-"what's my Claude usage?" and get the live session (5h) + weekly numbers from
-Anthropic's official `oauth/usage` endpoint (same data as `/usage`).
+usage** as tools, so any MCP client (Claude Code, Claude Desktop) can just *ask*
+"what's my Claude usage?" — plus a daily logger that records a usage history you can
+ask about later.
 
-## Tool
-- **`get_claude_usage`** — returns session (5-hour) and weekly utilization %, each
-  with time until reset. No arguments.
+## Tools
+- **`get_claude_usage`** — current session (5h) + weekly utilization %, each with
+  time until reset. Live from Anthropic's `oauth/usage` endpoint. No arguments.
+- **`get_usage_history`** — recorded usage snapshots over time (populated by the
+  daily logger). Optional `limit` argument.
 
 ## Auth
 Read-only. Finds a token from (in order): the fresh short-lived session token in
 `~/.claude/.credentials.json`, the macOS Keychain (`Claude Code-credentials`), a
 long-lived `claude setup-token` in `~/.config/claude-usage-bar/token`, or the
-`CLAUDE_CODE_OAUTH_TOKEN` env var. Never writes the token back. On a machine you use
-regularly it stays fresh automatically; if it 401s, run `claude` once.
+`CLAUDE_CODE_OAUTH_TOKEN` env var. Never writes the token back. If it 401s, run
+`claude` once on that machine.
 
 ## Install
 ```bash
@@ -30,14 +32,39 @@ claude mcp list          # should show: claude-usage ✓ Connected
 Then in any Claude Code session: *"what's my Claude usage?"* → it calls the tool.
 
 ## Register with Claude Desktop
-Add to `claude_desktop_config.json` (Settings → Developer → Edit Config):
+Settings → Developer → Edit Config → add:
 ```json
-{
-  "mcpServers": {
-    "claude-usage": { "command": "node", "args": ["/absolute/path/to/mcp/server.mjs"] }
-  }
-}
+{ "mcpServers": { "claude-usage": { "command": "node", "args": ["/abs/path/to/mcp/server.mjs"] } } }
 ```
+
+## Daily automation — usage history logger
+`log-usage.mjs` fetches usage and appends a snapshot to
+`~/.local/share/claude-usage-mcp/history.jsonl`. `get_usage_history` reads it back.
+
+Install it (this repo's `mcp/` copied to `~/claude-usage-mcp`), then schedule it.
+
+**Linux (systemd user timer):** copy `systemd/claude-usage-log.{service,timer}` to
+`~/.config/systemd/user/`, then:
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now claude-usage-log.timer   # runs daily
+systemctl --user start claude-usage-log.service        # log one now
+```
+Change cadence by editing `OnCalendar=` in the timer (e.g. `*-*-* 00/6:00:00` = every
+6 h for a richer trend).
+
+**macOS (launchd):** wrap `node .../log-usage.mjs` in a LaunchAgent with
+`StartCalendarInterval`. **Windows:** a Scheduled Task running
+`node ...\log-usage.mjs`.
+
+## Swap in your own daily task
+The logger is just the starter task. To run a *different* daily task, point the timer
+at your own command instead — e.g. a full Claude Code run:
+```
+ExecStart=/usr/bin/bash -lc 'claude -p "summarize my Claude usage today and note anything unusual"'
+```
+Because the MCP is registered user-wide, that `claude -p` run can call
+`get_claude_usage` / `get_usage_history` itself.
 
 ## Test manually
 ```bash
