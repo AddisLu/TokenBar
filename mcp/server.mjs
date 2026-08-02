@@ -12,7 +12,7 @@ const server = new McpServer({name: 'claude-usage', version: '1.1.0'});
 
 server.registerTool('get_claude_usage', {
     title: 'Get Claude usage',
-    description: 'Get the current REAL Claude subscription usage — session (5-hour rolling window) and weekly limits, each as a percentage used with time until reset. Source: Anthropic\'s official oauth/usage endpoint (same as Claude Code\'s /usage). Use when the user asks about their Claude usage, limits, quota, or when their session/weekly limit resets.',
+    description: 'Get the current REAL Claude subscription usage — the session (5-hour rolling window) limit, the all-model weekly limit, and any per-model weekly caps (e.g. Fable), each as a percentage used with time until reset. Source: Anthropic\'s official oauth/usage endpoint (same as Claude Code\'s /usage). Use when the user asks about their Claude usage, limits, quota, or when their session/weekly limit resets. Note a per-model cap is often the binding one — it can sit near 100% while the all-model weekly is still low.',
     inputSchema: {},
 }, async () => {
     const u = await fetchUsage();
@@ -27,8 +27,9 @@ server.registerTool('get_usage_history', {
     const rows = readHistory(limit ?? 60);
     if (!rows.length) return {content: [{type: 'text', text: 'No usage history recorded yet. The daily logger (log-usage.mjs) will populate it.'}]};
     const first = rows[0], last = rows[rows.length - 1];
+    const scoped = (last.scoped || []).map(l => `, ${l.name} ${l.percent}%`).join('');
     const summary = `Usage history: ${rows.length} snapshots from ${first.ts} to ${last.ts}. `
-        + `Latest — session ${last.session}%, weekly ${last.weekly}%.`;
+        + `Latest — session ${last.session}%, weekly ${last.weekly}%${scoped}.`;
     return {content: [{type: 'text', text: summary + '\n\n' + JSON.stringify(rows)}]};
 });
 

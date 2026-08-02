@@ -9,13 +9,17 @@ real, server-side numbers (not an estimate from local logs). Because that endpoi
 is **account-level**, every device shows the same combined usage; no syncing needed.
 
 ```
-◉  27% 1:17  ·  W 10%          ← session bar + reset countdown, weekly bar
+◉  27% 1:17  ·  W 10%  ·  F 89%   ← session bar + reset countdown, weekly bar, per-model weekly bar
 ```
 
 ## What it shows
 - **Session (5h)** utilization % + exact reset time (the window that resets often)
 - **Weekly** utilization % + reset time
-- A compact two-segment progress bar, colored green → orange → red
+- **Per-model weekly caps** (e.g. Fable), tagged with the model's initial — these are
+  often the binding limit, sitting near 100% while the all-model weekly is still low.
+  The segment only appears on accounts that have one; when several exist the bar shows
+  the most-consumed and the dropdown lists them all.
+- A compact progress bar, colored green → orange → red
 
 ## Platforms
 
@@ -31,6 +35,35 @@ All three refresh every **180 s** and share the same behaviour, including
 when the last success was very recent. So running the bar on several machines at once
 won't break — the shared account-level rate limit may occasionally 429, but each bar
 just keeps showing its last-good data with a small "throttled" note.
+
+## Sharing one fetch across machines
+
+That local cache is per-machine, so it makes each bar *degrade gracefully* — it does
+not reduce total requests. The rate limit is **account-level**, so N machines polling
+every 180 s means N× the requests against one budget, and the MCP server adds more
+(it fetches on every tool call). If you run TokenBar in several places, point them all
+at one file in a synced folder:
+
+```bash
+mkdir -p ~/.config/claude-usage-bar
+echo "$HOME/Library/Mobile Documents/com~apple~CloudDocs/tokenbar-usage.json" \
+  > ~/.config/claude-usage-bar/shared-cache-path      # iCloud Drive; or Dropbox/OneDrive/Syncthing
+```
+
+Or set `TOKENBAR_SHARED_CACHE` to the same path. Then whichever machine polls first
+pays for the fetch and the rest reuse it, so **total requests settle at roughly one
+per 150 s no matter how many machines you run** (instead of 20/hour each). All four
+surfaces — the three bars and the MCP server — read and write the same file.
+
+Details worth knowing:
+- Freshness window is 150 s, just under the 180 s poll, so a **single** machine behaves
+  exactly as before — nothing gets staler.
+- Writes are atomic (temp file + rename), so a peer mid-sync never reads a half-written
+  file; a corrupt or unreadable file is ignored and the bar just fetches normally.
+- A peer's clock running ahead is treated as fresh rather than as a stale entry.
+- A machine that is **not signed in** to Claude Code can still display the account's
+  usage from a peer's reading — handy for a work machine you don't run `claude` on.
+- Unset it and everything behaves exactly as it did before.
 
 ### macOS
 ```bash

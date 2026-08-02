@@ -34,6 +34,45 @@ $CacheDir  = Join-Path $env:LOCALAPPDATA 'ClaudeUsageBar'
 $CachePath = Join-Path $CacheDir 'cache.json'
 New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
 
+# ---- shared cache (optional; for accounts used from several machines) ----
+# The rate limit is account-level, so N machines each polling every 180s means N
+# times the requests against one budget. Point every machine at the same synced file
+# (OneDrive / Dropbox / Syncthing) and whichever polls first pays for the fetch; the
+# rest reuse it. Unset -> local-only, behaviour unchanged.
+#   path from $env:TOKENBAR_SHARED_CACHE, else ~\.config\claude-usage-bar\shared-cache-path
+# Format v1 is platform-neutral: {v,ts,sub,S,W,XL} - same shape all four surfaces use.
+$SharedTtlMs = 150000   # < the 180s poll, so single-machine freshness is unchanged
+function Get-SharedPath {
+  if ($env:TOKENBAR_SHARED_CACHE -and $env:TOKENBAR_SHARED_CACHE.Trim()) { return $env:TOKENBAR_SHARED_CACHE.Trim() }
+  $f = Join-Path $env:USERPROFILE '.config\claude-usage-bar\shared-cache-path'
+  try { $p = (Get-Content -Raw -Path $f -ErrorAction Stop).Trim(); if ($p) { return $p } } catch {}
+  return $null
+}
+function Read-Shared {
+  $p = Get-SharedPath; if (-not $p) { return $null }
+  try {
+    $o = Get-Content -Raw -Path $p -ErrorAction Stop | ConvertFrom-Json
+    if ($o.v -eq 1 -and $o.ts -ne $null) { return $o }
+  } catch {}
+  return $null
+}
+function Write-Shared($obj) {
+  $p = Get-SharedPath; if (-not $p) { return }
+  $t = "$p.tmp$PID"
+  try {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
+    $obj | ConvertTo-Json -Depth 8 | Set-Content -Path $t -Encoding UTF8
+    # Swap in whole, so a syncing peer never reads a half-written file. Replace needs
+    # an existing destination, so the first write is a plain move.
+    if (Test-Path $p) { [System.IO.File]::Replace($t, $p, $null) }
+    else { Move-Item -Force -Path $t -Destination $p }
+  } catch {
+    Remove-Item -Force -Path $t -ErrorAction SilentlyContinue   # never leave temp files behind
+  }
+}
+# Another machine's clock may run ahead of ours; treat "written in the future" as fresh.
+function Get-Age([double]$ts) { $a = [DateTimeOffset]::Now.ToUnixTimeMilliseconds() - $ts; if ($a -lt 0) { return 0 } return $a }
+
 # ---- palette (matches the Mac plugin) ----
 $GREEN  = [System.Drawing.Color]::FromArgb(255, 46, 194, 126)
 $ORANGE = [System.Drawing.Color]::FromArgb(255, 255, 120, 0)
@@ -74,29 +113,33 @@ function Add-RoundedRect($path, [single]$x, [single]$y, [single]$w, [single]$h, 
 }
 
 # returns an HICON handle (caller owns it, must DestroyIcon after swap)
-function New-BarIcon([double]$sp, $sCol, [double]$wp, $wCol) {
+# $bars is an array of @{ pct = <double>; col = <Color> } — session over weekly
+# normally, plus a third row when a scoped weekly cap (a per-model limit such as
+# Fable) is in play. Rows are shortened to fit the third into the same 32px icon.
+function New-BarIcon($bars) {
   $sz  = 32
   $bmp = New-Object System.Drawing.Bitmap($sz, $sz)
   $g   = [System.Drawing.Graphics]::FromImage($bmp)
   $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
   $g.Clear([System.Drawing.Color]::Transparent)
 
-  $x = [single]3; $w = [single]26; $bh = [single]10; $r = [single]4
-  $rows = @(
-    @{ y = [single]6;  pct = [math]::Min(100, $sp); col = $sCol },
-    @{ y = [single]18; pct = [math]::Min(100, $wp); col = $wCol }
-  )
-  foreach ($row in $rows) {
+  $rows = @($bars)
+  $x = [single]3; $w = [single]26; $r = [single]4
+  if ($rows.Count -ge 3) { $bh = [single]8;  $y0 = [single]2; $step = [single]10 }
+  else                   { $bh = [single]10; $y0 = [single]6; $step = [single]12 }
+  for ($i = 0; $i -lt $rows.Count; $i++) {
+    $y   = [single]($y0 + $i * $step)
+    $pct = [math]::Min(100, [double]$rows[$i].pct)
     # track
     $pt = New-Object System.Drawing.Drawing2D.GraphicsPath
-    Add-RoundedRect $pt $x $row.y $w $bh $r
+    Add-RoundedRect $pt $x $y $w $bh $r
     $bt = New-Object System.Drawing.SolidBrush($TRACK)
     $g.FillPath($bt, $pt); $bt.Dispose(); $pt.Dispose()
     # fill (min width = bar height so the rounded cap always shows)
-    $fw = [single][math]::Max([double]$bh, [math]::Round($w * $row.pct / 100.0))
+    $fw = [single][math]::Max([double]$bh, [math]::Round($w * $pct / 100.0))
     $pf = New-Object System.Drawing.Drawing2D.GraphicsPath
-    Add-RoundedRect $pf $x $row.y $fw $bh $r
-    $bf = New-Object System.Drawing.SolidBrush($row.col)
+    Add-RoundedRect $pf $x $y $fw $bh $r
+    $bf = New-Object System.Drawing.SolidBrush($rows[$i].col)
     $g.FillPath($bf, $pf); $bf.Dispose(); $pf.Dispose()
   }
   $g.Dispose()
@@ -146,15 +189,31 @@ function Set-Tray([IntPtr]$hicon, [string]$tip) {
   $script:LastHicon = $hicon
 }
 
-function Render($S, $W, $sub, $note) {
+# $XL holds the scoped weekly limits (per-model caps such as Fable). The icon has
+# room for one row, so it gets the most-consumed — that's the one that will cut you
+# off first — while the tooltip lists them all. Their lines are kept terse because
+# NotifyIcon.Text is capped at 127 chars.
+function Render($S, $W, $XL, $sub, $note) {
   $sp = [int][math]::Round([double]$S.percent)
   $wp = [int][math]::Round([double]$W.percent)
-  $sCol = Get-Sev-Color $sp $S.severity
-  $wCol = Get-Sev-Color $wp $W.severity
-  $hicon = New-BarIcon $sp $sCol $wp $wCol
+  $bars = @(
+    @{ pct = $sp; col = (Get-Sev-Color $sp $S.severity) },
+    @{ pct = $wp; col = (Get-Sev-Color $wp $W.severity) }
+  )
   $tip = "Claude$(if ($sub) { " - $sub" })`n" +
          "Session $sp%  $(Get-Countdown $S.resets_at)  (resets $(Get-Clock $S.resets_at))`n" +
          "Weekly $wp%  $(Get-Countdown $W.resets_at)  (resets $(Get-Clock $W.resets_at))"
+
+  $scoped = @(@($XL) | Where-Object { $_ } | Sort-Object { [double]$_.percent } -Descending)
+  if ($scoped.Count -gt 0) {
+    $xp = [int][math]::Round([double]$scoped[0].percent)
+    $bars += @{ pct = $xp; col = (Get-Sev-Color $xp $scoped[0].severity) }
+    foreach ($l in $scoped) {
+      $tip += "`n$($l.name) $([int][math]::Round([double]$l.percent))%  $(Get-Countdown $l.resets_at)"
+    }
+  }
+
+  $hicon = New-BarIcon $bars
   if ($note) { $tip = "$note`n$tip" }
   Set-Tray $hicon $tip
 }
@@ -169,8 +228,18 @@ function Update-Bar {
   $nowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
 
   # throttle guard: reuse a <50s-old success without hitting the API
-  if ($cache -and (($nowMs - [double]$cache.ts) -lt 50000)) {
-    Render $cache.S $cache.W $cache.sub $null
+  if ($cache -and ((Get-Age ([double]$cache.ts)) -lt 50000)) {
+    Render $cache.S $cache.W $cache.XL $cache.sub $null
+    return
+  }
+
+  # Another machine may have already paid for this data - reuse it rather than
+  # spending a second request against the shared account-level limit. Its ts is kept
+  # verbatim so "cached Ns ago" stays honest and the next poll re-evaluates correctly.
+  $sh = Read-Shared
+  if ($sh -and ((Get-Age ([double]$sh.ts)) -lt $SharedTtlMs)) {
+    Write-Cache ([pscustomobject]@{ sub = $sh.sub; S = $sh.S; W = $sh.W; XL = $sh.XL; ts = $sh.ts })
+    Render $sh.S $sh.W $sh.XL $sh.sub $null
     return
   }
 
@@ -192,21 +261,40 @@ function Update-Bar {
     if (-not $S -and $d.five_hour) { $S = [pscustomobject]@{ percent = $d.five_hour.utilization; resets_at = $d.five_hour.resets_at; severity = 'normal' } }
     if (-not $W -and $d.seven_day) { $W = [pscustomobject]@{ percent = $d.seven_day.utilization; resets_at = $d.seven_day.resets_at; severity = 'normal' } }
 
-    Write-Cache ([pscustomobject]@{ sub = $oauth.subscriptionType; S = $S; W = $W; ts = $nowMs })
-    Render $S $W $oauth.subscriptionType $null
+    # Per-model weekly caps (Fable today, Opus before it). Flattened to a plain name
+    # here so a cached copy stays renderable without re-reading the scope object.
+    $XL = @($d.limits | Where-Object { $_.kind -eq 'weekly_scoped' } | ForEach-Object {
+      $nm = $_.scope.model.display_name
+      if (-not $nm) { $nm = $_.scope.surface }
+      if (-not $nm) { $nm = 'scoped' }
+      [pscustomobject]@{ percent = $_.percent; resets_at = $_.resets_at; severity = $_.severity; name = $nm }
+    })
+
+    Write-Cache ([pscustomobject]@{ sub = $oauth.subscriptionType; S = $S; W = $W; XL = $XL; ts = $nowMs })
+    # Publish for the other machines/apps sharing this account's request budget.
+    Write-Shared ([pscustomobject]@{ v = 1; ts = $nowMs; sub = $oauth.subscriptionType; S = $S; W = $W; XL = $XL })
+    Render $S $W $XL $oauth.subscriptionType $null
   }
   catch {
     $code = $null
     try { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } } catch {}
-    if (-not (Test-Path $CredPath)) {
-      Show-Error 'Not logged in to Claude Code on this PC'
-      return
+
+    # newest of whatever we can still draw from - a peer's reading beats a blank icon,
+    # including on a PC that was never signed in
+    $fb = $null
+    if ($cache) { $fb = [pscustomobject]@{ S = $cache.S; W = $cache.W; XL = $cache.XL; sub = $cache.sub; ts = [double]$cache.ts } }
+    if ($sh -and ((-not $fb) -or ([double]$sh.ts -gt $fb.ts))) {
+      $fb = [pscustomobject]@{ S = $sh.S; W = $sh.W; XL = $sh.XL; sub = $sh.sub; ts = [double]$sh.ts }
     }
-    if ($cache) {
-      $age = [int][math]::Round(($nowMs - [double]$cache.ts) / 1000)
-      $note = if ($code) { "API $code - cached ${age}s ago" } else { "offline - cached ${age}s ago" }
-      Render $cache.S $cache.W $cache.sub $note
+
+    if ($fb) {
+      $age = [int][math]::Round((Get-Age $fb.ts) / 1000)
+      $note = if (-not (Test-Path $CredPath)) { "not signed in on this PC - cached ${age}s ago" }
+              elseif ($code) { "API $code - cached ${age}s ago" }
+              else { "offline - cached ${age}s ago" }
+      Render $fb.S $fb.W $fb.XL $fb.sub $note
     }
+    elseif (-not (Test-Path $CredPath)) { Show-Error 'Not logged in to Claude Code on this PC' }
     elseif ($code -eq 401 -or $code -eq 403) { Show-Error 'Token expired - run Claude Code once' }
     elseif ($code) { Show-Error "HTTP $code" }
     else { Show-Error 'Network error' }

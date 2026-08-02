@@ -15,6 +15,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 const POLL_SECONDS = 180;     // gentle on the rate-limited endpoint; countdown still recomputed each poll
 const SESSION_BAR = 64;       // px width of the session bar
 const WEEKLY_BAR = 48;        // px width of the weekly bar
+const SCOPED_BAR = 48;        // px width of the scoped-weekly bar (per-model cap, e.g. Fable)
 const BAR_HEIGHT = 12;
 // ------------------------------------------------------------------
 
@@ -77,6 +78,15 @@ class Indicator extends PanelMenu.Button {
         this._wLabel = new St.Label({text: '', style_class: 'cub-label', y_align: Clutter.ActorAlign.CENTER});
         box.add_child(this._wLabel);
 
+        // scoped weekly bar + label (per-model cap such as Fable; hidden when the
+        // account has none, so the panel keeps its old width)
+        this._xLabel0 = new St.Label({text: '', style_class: 'cub-tag', y_align: Clutter.ActorAlign.CENTER});
+        box.add_child(this._xLabel0);
+        this._xBar = makeBar(SCOPED_BAR);
+        box.add_child(this._xBar.track);
+        this._xLabel = new St.Label({text: '', style_class: 'cub-label', y_align: Clutter.ActorAlign.CENTER});
+        box.add_child(this._xLabel);
+
         this.add_child(box);
 
         // dropdown
@@ -85,6 +95,7 @@ class Indicator extends PanelMenu.Button {
         this.menu.addMenuItem(this._mTitle);
         this._mSession = this._infoItem();
         this._mWeekly = this._infoItem();
+        this._mScoped = this._infoItem();
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._mUpdated = this._infoItem();
         const refresh = new PopupMenu.PopupMenuItem('Refresh now');
@@ -107,6 +118,12 @@ class Indicator extends PanelMenu.Button {
         this._wLabel.visible = visible;
     }
 
+    _showScoped(visible) {
+        this._xLabel0.visible = visible;
+        this._xBar.track.visible = visible;
+        this._xLabel.visible = visible;
+    }
+
     _render(data) {
         if (!data.ok) {
             const err = data.error || '';
@@ -118,10 +135,12 @@ class Indicator extends PanelMenu.Button {
             this._sLabel.text = msg;
             setBar(this._sBar, 0, 'rgba(255,255,255,0.3)');
             this._showWeekly(false);
+            this._showScoped(false);
             this._mSession.label.text = data.error === 'auth-expired'
                 ? `Token expired — ${data.hint || 'run Claude Code once'}`
                 : `Unavailable (${data.error})`;
             this._mWeekly.label.text = '';
+            this._mScoped.visible = false;
             this._mUpdated.label.text = '';
             return;
         }
@@ -129,6 +148,12 @@ class Indicator extends PanelMenu.Button {
         this._icon.text = '◉';
         const s = data.session;
         const w = (data.limits || []).find(l => l.kind === 'weekly_all');
+        // Per-model weekly caps (Fable today, Opus before it). The panel has room
+        // for one, so it shows the most-consumed — that's the one that will cut you
+        // off first — while the dropdown lists them all.
+        const scoped = (data.limits || [])
+            .filter(l => l.kind === 'weekly_scoped')
+            .sort((a, b) => (b.percent ?? 0) - (a.percent ?? 0));
 
         // session (panel bar + countdown)
         if (s) {
@@ -152,6 +177,22 @@ class Indicator extends PanelMenu.Button {
         } else {
             this._showWeekly(false);
             this._mWeekly.label.text = 'Weekly: n/a';
+        }
+
+        // scoped weekly (third panel bar, tagged with the model's initial)
+        if (scoped.length) {
+            const x = scoped[0];
+            this._showScoped(true);
+            setBar(this._xBar, x.percent, colorFor(x.percent, x.severity));
+            this._xLabel0.text = ((x.scopeName || 'S')[0] || 'S').toUpperCase();
+            this._xLabel.text = `${x.percent}%`;
+            this._mScoped.visible = true;
+            this._mScoped.label.text = scoped
+                .map(l => `${l.label}: ${l.percent}%   resets ${l.resetsAt ? fmtReset(l.resetsAt) : 'n/a'}`)
+                .join('\n');
+        } else {
+            this._showScoped(false);
+            this._mScoped.visible = false;
         }
 
         this._mTitle.label.text = `Claude Usage${data.subscription ? ' — ' + data.subscription : ''}`;
