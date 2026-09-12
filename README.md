@@ -74,6 +74,12 @@ Details worth knowing:
 - Freshness window is 240 s. The poll stays at 180 s so countdowns keep ticking, but the
   network is touched at most once per window — roughly 10 requests/hour, account-wide.
 - `blockedUntil` in the same file carries a 429 cooldown between surfaces (see above).
+- When the API is unavailable, each surface draws from **whichever copy was fetched most
+  recently** — its own or a peer's. Preferring the local one would show this machine's
+  staler numbers while a newer reading sat in the shared file, so the bars would disagree.
+- The stale/cooldown warning stays hidden while that copy is under 10 minutes old. The
+  numbers are effectively live at that age and the "Updated HH:MM" stamp already says
+  how old they are; the ⚠ is kept for a reading old enough to actually mislead.
 - Writes are atomic (temp file + rename), so a peer mid-sync never reads a half-written
   file; a corrupt or unreadable file is ignored and the bar just fetches normally.
 - A peer's clock running ahead is treated as fresh rather than as a stale entry.

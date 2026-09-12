@@ -87,6 +87,10 @@ function Get-Age([double]$ts) { $a = [DateTimeOffset]::Now.ToUnixTimeMillisecond
 # Bounds keep a bogus Retry-After from parking the tray indefinitely, and a
 # burst-window 429 (Retry-After a few seconds) from turning into a tight retry loop.
 $CooldownMinMs = 60000; $CooldownMaxMs = 3900000; $CooldownDefaultMs = 300000
+# The tray draws from cache whenever the API is throttled, offline or in a cooldown.
+# While that copy is still recent the numbers are effectively live, so the tooltip's
+# note is held back until the reading is old enough to actually mislead.
+$QuietStaleMs = 600000
 
 # Retry-After off the failed response, as an absolute epoch-ms deadline.
 # PS 5.1 hands back an HttpWebResponse, PS 7 an HttpResponseMessage - read both.
@@ -327,7 +331,8 @@ function Update-Bar {
     $note = "rate-limited - retrying in $(Get-WaitText $wait)"
     if ($fb) {
       $age = [int][math]::Round((Get-Age $fb.ts) / 1000)
-      Render $fb.S $fb.W $fb.XL $fb.sub "$note (cached ${age}s ago)"
+      $shown = if ((Get-Age $fb.ts) -lt $QuietStaleMs) { $null } else { "$note (cached ${age}s ago)" }
+      Render $fb.S $fb.W $fb.XL $fb.sub $shown
     } else { Show-Error $note }
     return
   }
@@ -383,6 +388,7 @@ function Update-Bar {
               elseif (-not (Test-Path $CredPath)) { "not signed in on this PC - cached ${age}s ago" }
               elseif ($code) { "API $code - cached ${age}s ago" }
               else { "offline - cached ${age}s ago" }
+      if ((Get-Age $fb.ts) -lt $QuietStaleMs) { $note = $null }
       Render $fb.S $fb.W $fb.XL $fb.sub $note
     }
     elseif ($coolNote) { Show-Error $coolNote }

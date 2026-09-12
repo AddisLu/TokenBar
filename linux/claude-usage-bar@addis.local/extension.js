@@ -13,6 +13,11 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 // Config
 // ------------------------------------------------------------------
 const POLL_SECONDS = 180;     // gentle on the rate-limited endpoint; countdown still recomputed each poll
+// The panel is drawn from cache whenever the API is throttled, offline or in a 429
+// cooldown. While that copy is still recent the numbers are effectively live and the
+// ordinary "Updated HH:MM" stamp already says how old they are, so the warning line
+// is held back until the reading is old enough to actually mislead.
+const QUIET_STALE_SEC = 600;
 const SESSION_BAR = 64;       // px width of the session bar
 const WEEKLY_BAR = 48;        // px width of the weekly bar
 const SCOPED_BAR = 48;        // px width of the scoped-weekly bar (per-model cap, e.g. Fable)
@@ -200,7 +205,7 @@ class Indicator extends PanelMenu.Button {
 
         this._mTitle.label.text = `Claude Usage${data.subscription ? ' — ' + data.subscription : ''}`;
         const stamp = `Updated ${new Date(data.fetchedAt).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
-        if (data.stale) {
+        if (data.stale && (data.cacheAgeSec ?? 0) > QUIET_STALE_SEC) {
             // A 429 is a cooldown, not a dead end: say when we'll try again, so the
             // countdown explains why "Refresh now" is deliberately doing nothing.
             const why = data.note === 'auth-expired' ? 'token expired — run Claude Code'

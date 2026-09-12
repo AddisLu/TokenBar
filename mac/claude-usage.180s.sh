@@ -149,10 +149,16 @@ function render(S, W, XL, note){
   line('Refresh | refresh=true');
   process.exit(0);
 }
-const staleNote = (ts) => `⚠ API throttled — cached ${Math.round(ageOf(ts)/1000)}s ago`;
+// The plugin draws from cache whenever the API is throttled, offline or in a 429
+// cooldown. While that copy is still recent the numbers are effectively live, so the
+// note is held back until the reading is old enough to actually mislead.
+const QUIET_STALE_MS = 600_000;
+const quiet = (ts) => ageOf(ts) < QUIET_STALE_MS;
+const staleNote = (ts) => quiet(ts) ? null : `⚠ API throttled — cached ${Math.round(ageOf(ts)/1000)}s ago`;
 // A cooldown is not a dead end: say when we'll try again, so the frozen numbers
 // and a Refresh that deliberately does nothing both make sense.
-const coolNote = (ts, wait) => `⚠ rate-limited — retrying in ${cd(new Date(Date.now()+wait).toISOString())}, cached ${Math.round(ageOf(ts)/1000)}s ago`;
+const coolNote = (ts, wait) => quiet(ts) ? null
+  : `⚠ rate-limited — retrying in ${cd(new Date(Date.now()+wait).toISOString())}, cached ${Math.round(ageOf(ts)/1000)}s ago`;
 
 const cache = readCache();
 // Throttle guard: reuse a recent success and don't hit the API.

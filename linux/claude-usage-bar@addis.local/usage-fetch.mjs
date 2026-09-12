@@ -45,7 +45,6 @@ function out(o) { process.stdout.write(JSON.stringify(o)); }
 const readCache = () => { try { return JSON.parse(fs.readFileSync(CACHE, 'utf8')); } catch { return null; } };
 const writeCache = (o) => { try { fs.mkdirSync(path.dirname(CACHE), {recursive: true}); fs.writeFileSync(CACHE, JSON.stringify(o)); } catch {} };
 const ageSec = (ts) => Math.round(ageOf(ts) / 1000);
-const serveCache = (cache, note, extra) => { out({...cache.payload, stale: true, note, cacheAgeSec: ageSec(cache.ts), ...extra}); process.exit(0); };
 
 // ---- shared cache (optional; for accounts used from several machines) ----
 // The rate limit is account-level, so N machines each polling every 180s means N
@@ -172,23 +171,32 @@ if (!FORCE && haveShared && ageOf(sh.ts) < SHARED_TTL) {
     writeCache({ts: sh.ts, payload, blockedUntil: sh.blockedUntil});
     out(payload); process.exit(0);
 }
-// stale peer data is still better than a blank panel when the API is unavailable
-const serveShared = (note, extra) => { if (!haveShared) return; out({...payloadFromShared(sh), stale: true, note, cacheAgeSec: ageSec(sh.ts), ...extra}); process.exit(0); };
+// When the API is unavailable, draw from whichever copy was fetched most recently —
+// ours or a peer's. Preferring our own would show this machine's staler numbers while
+// a newer reading sat in the shared file, so the bars would disagree with each other.
+const freshest = () => {
+    const a = haveCache ? {ts: cache.ts, payload: cache.payload} : null;
+    const b = haveShared ? {ts: sh.ts, payload: payloadFromShared(sh)} : null;
+    if (a && b) return a.ts >= b.ts ? a : b;
+    return a || b || null;
+};
+const serveFreshest = (note, extra) => {
+    const f = freshest(); if (!f) return;
+    out({...f.payload, stale: true, note, cacheAgeSec: ageSec(f.ts), ...extra}); process.exit(0);
+};
 
 // Cooldown: we (or a peer) were told to back off. Show what we have and, crucially,
 // make no request — each one during the penalty pushes the hour out again.
 const wait = Math.max(waitFor(cache?.blockedUntil), waitFor(sh?.blockedUntil));
 if (wait > 0) {
     const extra = {rateLimited: true, retryInSec: Math.ceil(wait / 1000)};
-    if (haveCache) serveCache(cache, 'rate-limited', extra);
-    serveShared('rate-limited', extra);
+    serveFreshest('rate-limited', extra);
     out({ok: false, error: 'rate-limited', ...extra}); process.exit(0);
 }
 
 // Only now does a missing token matter — nothing above needed one.
 if (!tok) {
-    if (haveCache) serveCache(cache, 'no-credentials');
-    serveShared('no-credentials');
+    serveFreshest('no-credentials');
     out({ok: false, error: 'no-credentials'}); process.exit(0);
 }
 
@@ -204,21 +212,18 @@ try {
         signal: AbortSignal.timeout(15000),
     });
     if (res.status === 401 || res.status === 403) {
-        if (haveCache) serveCache(cache, authHint);
-        serveShared(authHint);
+        serveFreshest(authHint);
         out({ok: false, error: 'auth-expired', hint: authHint}); process.exit(0);
     }
     if (res.status === 429) {
         const until = cooldownUntil(res);
         recordCooldown(until, cache, sh);
         const extra = {rateLimited: true, retryInSec: Math.ceil((until - Date.now()) / 1000)};
-        if (haveCache) serveCache(cache, 'rate-limited', extra);
-        serveShared('rate-limited', extra);
+        serveFreshest('rate-limited', extra);
         out({ok: false, error: 'rate-limited', ...extra}); process.exit(0);
     }
     if (!res.ok) {
-        if (haveCache) serveCache(cache, `http-${res.status}`);
-        serveShared(`http-${res.status}`);
+        serveFreshest(`http-${res.status}`);
         out({ok: false, error: `http-${res.status}`}); process.exit(0);
     }
     const d = await res.json();
@@ -272,7 +277,6 @@ try {
     });
     out(payload);
 } catch (e) {
-    if (haveCache) serveCache(cache, 'offline');
-    serveShared('offline');
+    serveFreshest('offline');
     out({ok: false, error: 'network'});
 }
