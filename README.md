@@ -32,16 +32,31 @@ is **account-level**, every device shows the same combined usage; no syncing nee
 All three refresh every **180 s** and share the same behaviour, including
 **rate-limit resilience**: they cache the last good result and keep drawing the bar
 (countdowns recomputed live) when the endpoint returns 429 / errors, and skip the API
-when the last success was very recent. So running the bar on several machines at once
-won't break — the shared account-level rate limit may occasionally 429, but each bar
-just keeps showing its last-good data with a small "throttled" note.
+when the last success was very recent (< 240 s). So running the bar on several machines
+at once won't break — the shared account-level rate limit may occasionally 429, but each
+bar just keeps showing its last-good data with a small note saying when it will retry.
+
+### Backing off properly on a 429
+
+`oauth/usage` limits in two tiers: a short burst window (`Retry-After` a few seconds)
+and an **hour-long penalty** (`Retry-After` ~3600) — and a request made *during* the
+penalty restarts that hour. A client that keeps polling through a 429 therefore never
+recovers; it sits permanently on data that is exactly one hour old.
+
+So `Retry-After` is honoured as a hard cooldown. Until it expires **nothing** touches
+the network — not the 180 s poll, not the menu's "Refresh now", not the MCP server —
+and the bar shows `rate-limited — retrying in 42m` over its cached numbers. The
+deadline is written to the caches as `blockedUntil`, so one machine's 429 parks the
+others too; a success clears it. The wait is clamped to 1–65 min, so a bogus header
+can't park the bar indefinitely.
 
 ## Sharing one fetch across machines
 
 That local cache is per-machine, so it makes each bar *degrade gracefully* — it does
 not reduce total requests. The rate limit is **account-level**, so N machines polling
 every 180 s means N× the requests against one budget, and the MCP server adds more
-(it fetches on every tool call). If you run TokenBar in several places, point them all
+(it fetches on every tool call). Claude Code itself queries the same endpoint, so the
+bars are never the only consumer of the budget. If you run TokenBar in several places, point them all
 at one file in a synced folder:
 
 ```bash
@@ -52,12 +67,13 @@ echo "$HOME/Library/Mobile Documents/com~apple~CloudDocs/tokenbar-usage.json" \
 
 Or set `TOKENBAR_SHARED_CACHE` to the same path. Then whichever machine polls first
 pays for the fetch and the rest reuse it, so **total requests settle at roughly one
-per 150 s no matter how many machines you run** (instead of 20/hour each). All four
+per 240 s no matter how many machines you run** (instead of 20/hour each). All four
 surfaces — the three bars and the MCP server — read and write the same file.
 
 Details worth knowing:
-- Freshness window is 150 s, just under the 180 s poll, so a **single** machine behaves
-  exactly as before — nothing gets staler.
+- Freshness window is 240 s. The poll stays at 180 s so countdowns keep ticking, but the
+  network is touched at most once per window — roughly 10 requests/hour, account-wide.
+- `blockedUntil` in the same file carries a 429 cooldown between surfaces (see above).
 - Writes are atomic (temp file + rename), so a peer mid-sync never reads a half-written
   file; a corrupt or unreadable file is ignored and the bar just fetches normally.
 - A peer's clock running ahead is treated as fresh rather than as a stale entry.

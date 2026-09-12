@@ -18,6 +18,21 @@ long-lived `claude setup-token` in `~/.config/claude-usage-bar/token`, or the
 `CLAUDE_CODE_OAUTH_TOKEN` env var. Never writes the token back. If it 401s, run
 `claude` once on that machine.
 
+## Rate limits
+`oauth/usage` is account-level rate-limited, and this server used to be the worst
+offender — it fetches on every tool call. It now reads two caches before making any
+request, and writes to both after one: the cross-machine shared cache described in the
+[top-level README](../README.md#sharing-one-fetch-across-machines), and
+`~/.local/share/claude-usage/usage-cache.json` (override with `$CLAUDE_USAGE_CACHE`),
+the `{reading, ts}` envelope that other local tools use — so whichever of them fetched
+in the last 240 s serves everyone.
+
+On a 429 it honours `Retry-After` as a hard cooldown and answers from cache until it
+expires, publishing the deadline to both caches as `blockedUntil` so the status bars
+and the other machines sit it out too. The endpoint's hour-long penalty *restarts* on
+every request made while it holds, so retrying through a 429 is what keeps you locked
+out — the tool reports `not retrying for 42m` instead.
+
 ## Install
 ```bash
 cd mcp

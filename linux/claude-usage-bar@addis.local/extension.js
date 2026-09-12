@@ -99,7 +99,7 @@ class Indicator extends PanelMenu.Button {
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._mUpdated = this._infoItem();
         const refresh = new PopupMenu.PopupMenuItem('Refresh now');
-        refresh.connect('activate', () => this._refresh());
+        refresh.connect('activate', () => this._refresh(true));
         this.menu.addMenuItem(refresh);
 
         this._render({ok: false, error: 'loading'});
@@ -129,7 +129,8 @@ class Indicator extends PanelMenu.Button {
             const err = data.error || '';
             const msg = {
                 loading: 'Loading…', 'no-credentials': 'no login', 'no-token': 'no login',
-                'auth-expired': 'auth — open Claude', network: 'offline', 'http-429': 'rate-limited',
+                'auth-expired': 'auth — open Claude', network: 'offline',
+                'rate-limited': 'rate-limited', 'http-429': 'rate-limited',
             }[err] || (/^http-\d/.test(err) ? 'API error' : err);
             this._icon.text = '○';
             this._sLabel.text = msg;
@@ -138,6 +139,8 @@ class Indicator extends PanelMenu.Button {
             this._showScoped(false);
             this._mSession.label.text = data.error === 'auth-expired'
                 ? `Token expired — ${data.hint || 'run Claude Code once'}`
+                : data.error === 'rate-limited'
+                ? `Rate-limited — retrying in ${fmtCountdown((data.retryInSec || 0) * 1000)}`
                 : `Unavailable (${data.error})`;
             this._mWeekly.label.text = '';
             this._mScoped.visible = false;
@@ -198,8 +201,11 @@ class Indicator extends PanelMenu.Button {
         this._mTitle.label.text = `Claude Usage${data.subscription ? ' — ' + data.subscription : ''}`;
         const stamp = `Updated ${new Date(data.fetchedAt).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
         if (data.stale) {
+            // A 429 is a cooldown, not a dead end: say when we'll try again, so the
+            // countdown explains why "Refresh now" is deliberately doing nothing.
             const why = data.note === 'auth-expired' ? 'token expired — run Claude Code'
                 : data.note === 'offline' ? 'offline'
+                : data.rateLimited ? `rate-limited — retrying in ${fmtCountdown((data.retryInSec || 0) * 1000)}`
                 : `API throttled (${data.note})`;
             this._mUpdated.label.text = `⚠ ${why} — cached ${data.cacheAgeSec ?? '?'}s ago`;
         } else {
@@ -207,7 +213,9 @@ class Indicator extends PanelMenu.Button {
         }
     }
 
-    _refresh() {
+    // `force` (the "Refresh now" item) makes the fetcher skip its freshness guards.
+    // It still obeys a 429 cooldown — retrying during the penalty is what extends it.
+    _refresh(force = false) {
         if (this._cancellable) this._cancellable.cancel();
         this._cancellable = new Gio.Cancellable();
         const script = GLib.build_filenamev([this._ext.path, 'usage-fetch.mjs']);
@@ -215,7 +223,7 @@ class Indicator extends PanelMenu.Button {
         let proc;
         try {
             proc = Gio.Subprocess.new(
-                ['/bin/bash', '-lc', `node ${GLib.shell_quote(script)}`],
+                ['/bin/bash', '-lc', `node ${GLib.shell_quote(script)}${force ? ' --force' : ''}`],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
         } catch (e) {
             this._render({ok: false, error: 'spawn'});

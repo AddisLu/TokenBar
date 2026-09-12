@@ -5,7 +5,9 @@
 # Draws a graphical progress bar (PNG) to match the Linux GNOME version.
 # Resilient to the endpoint's tight rate limit: caches the last good result and
 # keeps drawing the bar (countdowns recomputed live) when the API returns 429 /
-# errors, and skips the API entirely if the last success was <50s ago.
+# errors, and skips the API entirely if the last success was recent. A 429's
+# Retry-After is honoured as a hard cooldown — the limiter's hour-long penalty
+# restarts on every request made during it, so polling through one never recovers.
 # <bitbar.title>Claude Usage</bitbar.title>
 # <bitbar.desc>Real Claude session + weekly usage and reset (Max/Pro)</bitbar.desc>
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -35,8 +37,11 @@ const writeCache = (o) => { try { fs.mkdirSync(path.dirname(CACHE), {recursive:t
 // fetch; the rest reuse it. Total settles at roughly one request per SHARED_TTL
 // regardless of machine count. Unset → local-only, behaviour unchanged.
 //   path from $TOKENBAR_SHARED_CACHE, else ~/.config/claude-usage-bar/shared-cache-path
-// Format v1 is platform-neutral: {v,ts,sub,S,W,XL} — same shape all four surfaces use.
-const SHARED_TTL = 150_000;   // < the 180s poll, so single-machine freshness is unchanged
+// Format v1 is platform-neutral: {v,ts,sub,S,W,XL,blockedUntil} — same shape all four
+// surfaces use. blockedUntil is a 429 cooldown: the limit is per-account, so one
+// machine's penalty has to park the others too.
+const SHARED_TTL = 240_000;   // matches THROTTLE_MS: one fetch per window, account-wide
+const THROTTLE_MS = 240_000;  // reuse a recent success instead of re-hitting the API
 function sharedPath(){
   const e = (process.env.TOKENBAR_SHARED_CACHE || '').trim();
   if (e) return e;
@@ -60,6 +65,26 @@ function writeShared(o){
 // Another machine's clock may run ahead of ours; treat "written in the future" as fresh
 // rather than as a wildly stale entry.
 const ageOf = (ts) => Math.max(0, Date.now() - ts);
+
+// ---- 429 cooldown ----
+// Two tiers: a short burst window (Retry-After a few seconds) and an hour-long
+// penalty (Retry-After ~3600) that restarts on every request made while it holds.
+// So we stop completely until it expires — SwiftBar's Refresh included. Bounds keep
+// a bogus header from parking the plugin indefinitely.
+const COOLDOWN_MIN_MS = 60_000, COOLDOWN_MAX_MS = 3_900_000, COOLDOWN_DEFAULT_MS = 300_000;
+function cooldownFrom(res){
+  const raw = (res.headers.get('retry-after') || '').trim();
+  let ms = COOLDOWN_DEFAULT_MS;
+  if (raw) {
+    const n = Number(raw);
+    if (Number.isFinite(n)) ms = n * 1000;                       // delta-seconds form
+    else { const d = Date.parse(raw); if (!Number.isNaN(d)) ms = d - Date.now(); }   // HTTP-date form
+  }
+  return Date.now() + Math.min(COOLDOWN_MAX_MS, Math.max(COOLDOWN_MIN_MS, ms));
+}
+// Remaining cooldown, clamped so a peer's skewed clock can't park us for a week.
+const waitFor = (until) => (typeof until === 'number' && until > Date.now())
+  ? Math.min(until - Date.now(), COOLDOWN_MAX_MS) : 0;
 
 // A missing token is not fatal here — the shared cache is consulted first (below), so
 // a Mac that never signs in can still display a peer's reading. Checked before fetching.
@@ -125,28 +150,47 @@ function render(S, W, XL, note){
   process.exit(0);
 }
 const staleNote = (ts) => `⚠ API throttled — cached ${Math.round(ageOf(ts)/1000)}s ago`;
+// A cooldown is not a dead end: say when we'll try again, so the frozen numbers
+// and a Refresh that deliberately does nothing both make sense.
+const coolNote = (ts, wait) => `⚠ rate-limited — retrying in ${cd(new Date(Date.now()+wait).toISOString())}, cached ${Math.round(ageOf(ts)/1000)}s ago`;
 
 const cache = readCache();
-// Throttle guard: if we fetched successfully <50s ago, reuse it and don't hit the API.
-if (cache && ageOf(cache.ts) < 50_000) render(cache.S, cache.W, cache.XL);
+// Throttle guard: reuse a recent success and don't hit the API.
+if (cache && cache.ts > 0 && ageOf(cache.ts) < THROTTLE_MS) render(cache.S, cache.W, cache.XL);
 
 // Another machine may have already paid for this data — reuse it rather than
 // spending a second request against the shared account-level limit. Its ts is kept
 // verbatim so "cached Ns ago" stays honest and the next poll re-evaluates correctly.
 const sh = readShared();
 if (!sub && sh?.sub) sub = sh.sub;   // peer knows the plan even if we have no creds
-if (sh && ageOf(sh.ts) < SHARED_TTL) {
-  writeCache({sub: sh.sub ?? sub, S: sh.S, W: sh.W, XL: sh.XL, ts: sh.ts});
+const shHasData = !!(sh && sh.ts > 0 && (sh.S || sh.W));
+if (shHasData && ageOf(sh.ts) < SHARED_TTL) {
+  writeCache({sub: sh.sub ?? sub, S: sh.S, W: sh.W, XL: sh.XL, ts: sh.ts, blockedUntil: sh.blockedUntil});
   render(sh.S, sh.W, sh.XL);
 }
 
 // newest of whatever we can still draw from when the API is unavailable
 const fallback = () => {
-  const a = cache ? {S:cache.S, W:cache.W, XL:cache.XL, ts:cache.ts} : null;
-  const b = sh ? {S:sh.S, W:sh.W, XL:sh.XL, ts:sh.ts} : null;
+  const a = (cache && cache.ts > 0 && (cache.S || cache.W)) ? {S:cache.S, W:cache.W, XL:cache.XL, ts:cache.ts} : null;
+  const b = shHasData ? {S:sh.S, W:sh.W, XL:sh.XL, ts:sh.ts} : null;
   if (a && b) return a.ts >= b.ts ? a : b;
   return a || b || null;
 };
+// Publish a cooldown to both caches. The shared entry is merged, never replaced, so
+// peers keep the last good reading to draw from while everyone sits it out.
+function recordCooldown(until){
+  writeCache({...(cache || {ts:0}), sub: cache?.sub ?? sub, blockedUntil: until});
+  if (sharedPath()) writeShared({...(sh || {v:1, ts:0}), v:1, blockedUntil: until});
+}
+
+// Cooldown in force (ours or a peer's): draw what we have and make no request —
+// each one during the penalty pushes the hour out again.
+const wait = Math.max(waitFor(cache?.blockedUntil), waitFor(sh?.blockedUntil));
+if (wait > 0) {
+  const f = fallback();
+  if (f) render(f.S, f.W, f.XL, coolNote(f.ts, wait));
+  bad(`Rate-limited — retrying in ${cd(new Date(Date.now()+wait).toISOString())}`);
+}
 
 // Only now does a missing token matter — nothing above needed one.
 if (!tok) {
@@ -165,6 +209,13 @@ try {
     if (f) render(f.S, f.W, f.XL, '⚠ Token expired — run Claude Code once');
     bad('Token expired — run Claude Code once');
   }
+  if (res.status === 429) {
+    const until = cooldownFrom(res);
+    recordCooldown(until);
+    const f = fallback();
+    if (f) render(f.S, f.W, f.XL, coolNote(f.ts, until - Date.now()));
+    bad(`Rate-limited — retrying in ${cd(new Date(until).toISOString())}`);
+  }
   if (!res.ok) {
     const f = fallback();
     if (f) render(f.S, f.W, f.XL, staleNote(f.ts));
@@ -181,6 +232,7 @@ try {
     name:l.scope?.model?.display_name||l.scope?.surface||'scoped',
   }));
   const now = Date.now();
+  // omitting blockedUntil clears any cooldown: the budget is evidently back
   writeCache({sub, S, W, XL, ts: now});
   writeShared({v:1, ts: now, sub, S, W, XL});
   render(S, W, XL);

@@ -9,8 +9,12 @@
 
   Resilient to the endpoint's tight rate limit, exactly like the Mac version:
     - caches the last good result and keeps drawing the bar (countdowns
-      recomputed live) when the API returns 429 / errors, and
-    - skips the API entirely if the last success was < 50s ago.
+      recomputed live) when the API returns 429 / errors,
+    - skips the API entirely if the last success was recent, and
+    - honours a 429's Retry-After as a hard cooldown. The limiter's hour-long
+      penalty restarts on every request made while it holds, so a client that
+      keeps polling through a 429 never recovers; during the cooldown nothing
+      here touches the network, the tray Refresh included.
 
   Credentials are read (read-only) from %USERPROFILE%\.claude\.credentials.json.
   Run:  powershell -ExecutionPolicy Bypass -File claude-usage-tray.ps1
@@ -40,8 +44,11 @@ New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
 # (OneDrive / Dropbox / Syncthing) and whichever polls first pays for the fetch; the
 # rest reuse it. Unset -> local-only, behaviour unchanged.
 #   path from $env:TOKENBAR_SHARED_CACHE, else ~\.config\claude-usage-bar\shared-cache-path
-# Format v1 is platform-neutral: {v,ts,sub,S,W,XL} - same shape all four surfaces use.
-$SharedTtlMs = 150000   # < the 180s poll, so single-machine freshness is unchanged
+# Format v1 is platform-neutral: {v,ts,sub,S,W,XL,blockedUntil} - same shape all four
+# surfaces use. blockedUntil is a 429 cooldown: the limit is per-account, so one
+# machine's penalty has to park the others too.
+$SharedTtlMs = 240000   # matches $ThrottleMs: one fetch per window, account-wide
+$ThrottleMs  = 240000   # reuse a recent success instead of re-hitting the API
 function Get-SharedPath {
   if ($env:TOKENBAR_SHARED_CACHE -and $env:TOKENBAR_SHARED_CACHE.Trim()) { return $env:TOKENBAR_SHARED_CACHE.Trim() }
   $f = Join-Path $env:USERPROFILE '.config\claude-usage-bar\shared-cache-path'
@@ -63,8 +70,11 @@ function Write-Shared($obj) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
     $obj | ConvertTo-Json -Depth 8 | Set-Content -Path $t -Encoding UTF8
     # Swap in whole, so a syncing peer never reads a half-written file. Replace needs
-    # an existing destination, so the first write is a plain move.
-    if (Test-Path $p) { [System.IO.File]::Replace($t, $p, $null) }
+    # an existing destination, so the first write is a plain move. The backup argument
+    # must be [NullString]::Value, not $null: PowerShell turns a $null bound to a
+    # string parameter into "", and Replace rejects an empty path - which made every
+    # write after the first throw and be swallowed, freezing the shared cache.
+    if (Test-Path $p) { [System.IO.File]::Replace($t, $p, [NullString]::Value) }
     else { Move-Item -Force -Path $t -Destination $p }
   } catch {
     Remove-Item -Force -Path $t -ErrorAction SilentlyContinue   # never leave temp files behind
@@ -72,6 +82,49 @@ function Write-Shared($obj) {
 }
 # Another machine's clock may run ahead of ours; treat "written in the future" as fresh.
 function Get-Age([double]$ts) { $a = [DateTimeOffset]::Now.ToUnixTimeMilliseconds() - $ts; if ($a -lt 0) { return 0 } return $a }
+
+# ---- 429 cooldown ----
+# Bounds keep a bogus Retry-After from parking the tray indefinitely, and a
+# burst-window 429 (Retry-After a few seconds) from turning into a tight retry loop.
+$CooldownMinMs = 60000; $CooldownMaxMs = 3900000; $CooldownDefaultMs = 300000
+
+# Retry-After off the failed response, as an absolute epoch-ms deadline.
+# PS 5.1 hands back an HttpWebResponse, PS 7 an HttpResponseMessage - read both.
+function Get-CooldownUntil($err) {
+  $raw = $null
+  try {
+    $h = $err.Exception.Response.Headers
+    if ($h) {
+      if ($h -is [System.Net.WebHeaderCollection]) { $raw = $h['Retry-After'] }
+      else { $v = $null; if ($h.TryGetValues('Retry-After', [ref]$v)) { $raw = @($v)[0] } }
+    }
+  } catch {}
+  $ms = $CooldownDefaultMs
+  if ($raw) {
+    $n = 0.0
+    if ([double]::TryParse(([string]$raw).Trim(), [ref]$n)) { $ms = $n * 1000 }   # delta-seconds form
+    else {
+      try { $ms = ([datetimeoffset]::Parse($raw) - [datetimeoffset]::Now).TotalMilliseconds } catch {}   # HTTP-date form
+    }
+  }
+  if ($ms -lt $CooldownMinMs) { $ms = $CooldownMinMs }
+  if ($ms -gt $CooldownMaxMs) { $ms = $CooldownMaxMs }
+  return [DateTimeOffset]::Now.ToUnixTimeMilliseconds() + $ms
+}
+# Remaining cooldown in ms, clamped so a peer's skewed clock can't park us for a week.
+function Get-Wait($until) {
+  if ($null -eq $until) { return 0 }
+  $u = 0.0
+  try { $u = [double]$until } catch { return 0 }   # JSON gives a number; anything else is ignored
+  $rem = $u - [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+  if ($rem -le 0) { return 0 }
+  if ($rem -gt $CooldownMaxMs) { return $CooldownMaxMs }
+  return $rem
+}
+# "42m" / "1:05" for a wait in ms, same shape as the reset countdowns
+function Get-WaitText([double]$ms) {
+  return (Get-Countdown ([DateTimeOffset]::Now.AddMilliseconds($ms).ToString('o')))
+}
 
 # ---- palette (matches the Mac plugin) ----
 $GREEN  = [System.Drawing.Color]::FromArgb(255, 46, 194, 126)
@@ -167,6 +220,17 @@ function Write-Cache($obj) {
   try { $obj | ConvertTo-Json -Depth 8 | Set-Content -Path $CachePath -Encoding UTF8 } catch {}
 }
 
+# Publish a cooldown to both caches. The shared entry keeps the last good reading
+# peers draw from - only blockedUntil changes.
+function Publish-Cooldown([double]$until, $cache, $sh) {
+  $c = if ($cache) { $cache } else { [pscustomobject]@{ ts = 0 } }
+  Write-Cache ([pscustomobject]@{ sub = $c.sub; S = $c.S; W = $c.W; XL = $c.XL; ts = $c.ts; blockedUntil = $until })
+  if (Get-SharedPath) {
+    $o = if ($sh) { $sh } else { [pscustomobject]@{ ts = 0 } }
+    Write-Shared ([pscustomobject]@{ v = 1; ts = $o.ts; sub = $o.sub; S = $o.S; W = $o.W; XL = $o.XL; blockedUntil = $until })
+  }
+}
+
 # ---- tray plumbing ----
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Visible = $true
@@ -223,12 +287,17 @@ function Show-Error([string]$msg) {
   Set-Tray $hicon ("Claude usage`n$msg")
 }
 
+# -Force is the tray's Refresh: it skips the freshness guards but never the
+# cooldown - a manual retry during the penalty is exactly what extends it.
 function Update-Bar {
+  param([switch]$Force)
+
   $cache = Read-Cache
   $nowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+  $haveCache = $cache -and ([double]$cache.ts -gt 0) -and ($cache.S -or $cache.W)
 
-  # throttle guard: reuse a <50s-old success without hitting the API
-  if ($cache -and ((Get-Age ([double]$cache.ts)) -lt 50000)) {
+  # throttle guard: reuse a recent success without hitting the API
+  if ((-not $Force) -and $haveCache -and ((Get-Age ([double]$cache.ts)) -lt $ThrottleMs)) {
     Render $cache.S $cache.W $cache.XL $cache.sub $null
     return
   }
@@ -237,9 +306,29 @@ function Update-Bar {
   # spending a second request against the shared account-level limit. Its ts is kept
   # verbatim so "cached Ns ago" stays honest and the next poll re-evaluates correctly.
   $sh = Read-Shared
-  if ($sh -and ((Get-Age ([double]$sh.ts)) -lt $SharedTtlMs)) {
-    Write-Cache ([pscustomobject]@{ sub = $sh.sub; S = $sh.S; W = $sh.W; XL = $sh.XL; ts = $sh.ts })
+  $haveShared = $sh -and ([double]$sh.ts -gt 0) -and ($sh.S -or $sh.W)
+  if ((-not $Force) -and $haveShared -and ((Get-Age ([double]$sh.ts)) -lt $SharedTtlMs)) {
+    Write-Cache ([pscustomobject]@{ sub = $sh.sub; S = $sh.S; W = $sh.W; XL = $sh.XL; ts = $sh.ts; blockedUntil = $sh.blockedUntil })
     Render $sh.S $sh.W $sh.XL $sh.sub $null
+    return
+  }
+
+  # newest of whatever we can still draw from - a peer's reading beats a blank icon,
+  # including on a PC that was never signed in
+  $fb = $null
+  if ($haveCache) { $fb = [pscustomobject]@{ S = $cache.S; W = $cache.W; XL = $cache.XL; sub = $cache.sub; ts = [double]$cache.ts } }
+  if ($haveShared -and ((-not $fb) -or ([double]$sh.ts -gt $fb.ts))) {
+    $fb = [pscustomobject]@{ S = $sh.S; W = $sh.W; XL = $sh.XL; sub = $sh.sub; ts = [double]$sh.ts }
+  }
+
+  # Cooldown in force (ours or a peer's): draw what we have and make no request.
+  $wait = [math]::Max([double](Get-Wait $cache.blockedUntil), [double](Get-Wait $sh.blockedUntil))
+  if ($wait -gt 0) {
+    $note = "rate-limited - retrying in $(Get-WaitText $wait)"
+    if ($fb) {
+      $age = [int][math]::Round((Get-Age $fb.ts) / 1000)
+      Render $fb.S $fb.W $fb.XL $fb.sub "$note (cached ${age}s ago)"
+    } else { Show-Error $note }
     return
   }
 
@@ -270,6 +359,7 @@ function Update-Bar {
       [pscustomobject]@{ percent = $_.percent; resets_at = $_.resets_at; severity = $_.severity; name = $nm }
     })
 
+    # a success clears the cooldown on both caches (blockedUntil simply omitted)
     Write-Cache ([pscustomobject]@{ sub = $oauth.subscriptionType; S = $S; W = $W; XL = $XL; ts = $nowMs })
     # Publish for the other machines/apps sharing this account's request budget.
     Write-Shared ([pscustomobject]@{ v = 1; ts = $nowMs; sub = $oauth.subscriptionType; S = $S; W = $W; XL = $XL })
@@ -279,21 +369,23 @@ function Update-Bar {
     $code = $null
     try { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } } catch {}
 
-    # newest of whatever we can still draw from - a peer's reading beats a blank icon,
-    # including on a PC that was never signed in
-    $fb = $null
-    if ($cache) { $fb = [pscustomobject]@{ S = $cache.S; W = $cache.W; XL = $cache.XL; sub = $cache.sub; ts = [double]$cache.ts } }
-    if ($sh -and ((-not $fb) -or ([double]$sh.ts -gt $fb.ts))) {
-      $fb = [pscustomobject]@{ S = $sh.S; W = $sh.W; XL = $sh.XL; sub = $sh.sub; ts = [double]$sh.ts }
+    # A 429 parks every consumer of this account, here and on the other machines.
+    $coolNote = $null
+    if ($code -eq 429) {
+      $until = Get-CooldownUntil $_
+      Publish-Cooldown $until $cache $sh
+      $coolNote = "rate-limited - retrying in $(Get-WaitText (Get-Wait $until))"
     }
 
     if ($fb) {
       $age = [int][math]::Round((Get-Age $fb.ts) / 1000)
-      $note = if (-not (Test-Path $CredPath)) { "not signed in on this PC - cached ${age}s ago" }
+      $note = if ($coolNote) { "$coolNote (cached ${age}s ago)" }
+              elseif (-not (Test-Path $CredPath)) { "not signed in on this PC - cached ${age}s ago" }
               elseif ($code) { "API $code - cached ${age}s ago" }
               else { "offline - cached ${age}s ago" }
       Render $fb.S $fb.W $fb.XL $fb.sub $note
     }
+    elseif ($coolNote) { Show-Error $coolNote }
     elseif (-not (Test-Path $CredPath)) { Show-Error 'Not logged in to Claude Code on this PC' }
     elseif ($code -eq 401 -or $code -eq 403) { Show-Error 'Token expired - run Claude Code once' }
     elseif ($code) { Show-Error "HTTP $code" }
@@ -301,7 +393,7 @@ function Update-Bar {
   }
 }
 
-$miRefresh.add_Click({ Update-Bar })
+$miRefresh.add_Click({ Update-Bar -Force })
 $miQuit.add_Click({
   $notify.Visible = $false
   if ($script:LastHicon -ne [IntPtr]::Zero) { [IconUtil]::DestroyIcon($script:LastHicon) | Out-Null }
