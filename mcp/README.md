@@ -24,8 +24,8 @@ offender — it fetches on every tool call. It now reads two caches before makin
 request, and writes to both after one: the cross-machine shared cache described in the
 [top-level README](../README.md#sharing-one-fetch-across-machines), and
 `~/.local/share/claude-usage/usage-cache.json` (override with `$CLAUDE_USAGE_CACHE`),
-the `{reading, ts}` envelope that other local tools use — so whichever of them fetched
-in the last 240 s serves everyone.
+the `{reading, ts}` envelope that the status bars and other local tools (Loop
+Engineering) use. Whichever of them fetched in the last 240 s serves everyone.
 
 On a 429 it honours `Retry-After` as a hard cooldown and answers from cache until it
 expires, publishing the deadline to both caches as `blockedUntil` so the status bars

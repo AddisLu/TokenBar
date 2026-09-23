@@ -63,12 +63,15 @@ function Read-Shared {
   } catch {}
   return $null
 }
-function Write-Shared($obj) {
-  $p = Get-SharedPath; if (-not $p) { return }
+function Write-Shared($obj) { $p = Get-SharedPath; if ($p) { Write-Atomic $p $obj } }
+function Write-Atomic([string]$p, $obj) {
   $t = "$p.tmp$PID"
   try {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
-    $obj | ConvertTo-Json -Depth 8 | Set-Content -Path $t -Encoding UTF8
+    # UTF-8 without a BOM. Windows PowerShell's Set-Content -Encoding UTF8 writes one, and
+    # the Node readers of these files (the other bars, the MCP server, Loop's engine)
+    # fail JSON.parse on it - they silently ignored every file this tray wrote.
+    [System.IO.File]::WriteAllText($t, ($obj | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
     # Swap in whole, so a syncing peer never reads a half-written file. Replace needs
     # an existing destination, so the first write is a plain move. The backup argument
     # must be [NullString]::Value, not $null: PowerShell turns a $null bound to a
@@ -82,6 +85,70 @@ function Write-Shared($obj) {
 }
 # Another machine's clock may run ahead of ours; treat "written in the future" as fresh.
 function Get-Age([double]$ts) { $a = [DateTimeOffset]::Now.ToUnixTimeMilliseconds() - $ts; if ($a -lt 0) { return 0 } return $a }
+
+# ---- cross-tool cache (the tools on THIS machine) ----
+# The MCP server (mcp/usage-core.mjs) and Loop Engineering share usage through one local
+# file, {reading, ts, blockedUntil}; the tray joins it. Above all it needs the cooldown: a
+# consumer that can't see another's 429 takes turns with it restarting the hour-long
+# penalty, even when both honour Retry-After. Per-machine; the file above crosses machines.
+# Same path Node's os.homedir() gives usage-core here.
+$XToolPath = if ($env:CLAUDE_USAGE_CACHE) { $env:CLAUDE_USAGE_CACHE } else { Join-Path $env:USERPROFILE '.local\share\claude-usage\usage-cache.json' }
+function Read-XTool {
+  try { return (Get-Content -Raw -Path $XToolPath -ErrorAction Stop | ConvertFrom-Json) } catch { return $null }
+}
+# ISO-8601 as JavaScript writes it. PowerShell 7's ConvertFrom-Json turns date strings into
+# [datetime]; normalise so what goes back out still parses the same everywhere.
+function Get-IsoString($v) {
+  if ($null -eq $v -or '' -eq $v) { return $null }
+  if ($v -is [datetime]) { $v = [datetimeoffset]$v }
+  if ($v -is [datetimeoffset]) { return $v.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [cultureinfo]::InvariantCulture) }
+  return [string]$v
+}
+function Get-EpochMs($v) {
+  $iso = Get-IsoString $v; if (-not $iso) { return $null }
+  try { return [double][datetimeoffset]::Parse($iso, [cultureinfo]::InvariantCulture).ToUnixTimeMilliseconds() } catch { return $null }
+}
+# When the reading was taken. Older Loop builds re-stamped a cached reading `ts: now`, so
+# take the earlier of ts and its own fetchedAt - a re-dated old reading must not pass for fresh.
+function Get-XToolTakenAt($xt) {
+  $ts = [double]$xt.ts
+  $f = Get-EpochMs $xt.reading.fetchedAt
+  if ($null -ne $f -and $f -lt $ts) { return $f }
+  return $ts
+}
+# usage-core's reading shape (camelCase resetsAt, scoped[] with a name) <-> S/W/XL here
+function ConvertFrom-XToolLimit($x) {
+  if (-not $x) { return $null }
+  $sev = if ($x.severity) { $x.severity } else { 'normal' }
+  return [pscustomobject]@{ percent = $x.percent; resets_at = (Get-IsoString $x.resetsAt); severity = $sev }
+}
+function ConvertTo-XToolLimit($x, [double]$nowMs) {
+  if (-not $x) { return $null }
+  $iso = Get-IsoString $x.resets_at
+  $mins = $null
+  $at = Get-EpochMs $iso
+  if ($null -ne $at) { $mins = [int][math]::Max(0, [math]::Round(($at - $nowMs) / 60000)) }
+  $sev = if ($x.severity) { $x.severity } else { 'normal' }
+  return [pscustomobject]@{ percent = [int][math]::Round([double]$x.percent); resetsAt = $iso; resetsInMinutes = $mins; severity = $sev }
+}
+function New-XToolReading($S, $W, $XL, $sub, [double]$nowMs) {
+  $scoped = @(@($XL) | Where-Object { $_ } | ForEach-Object {
+    ConvertTo-XToolLimit $_ $nowMs | Add-Member -NotePropertyName name -NotePropertyValue $_.name -PassThru
+  } | Sort-Object { [double]$_.percent } -Descending)
+  return [pscustomobject]@{
+    ok = $true; subscription = $sub
+    fetchedAt = (Get-IsoString ([DateTimeOffset]::FromUnixTimeMilliseconds([long]$nowMs)))
+    session = (ConvertTo-XToolLimit $S $nowMs); weekly = (ConvertTo-XToolLimit $W $nowMs)
+    scoped = $scoped
+  }
+}
+function Get-XToolView($xt, [double]$takenAt, $fallbackSub) {
+  $sub = if ($xt.reading.subscription) { $xt.reading.subscription } else { $fallbackSub }
+  $XL = @(@($xt.reading.scoped) | Where-Object { $_ } | ForEach-Object {
+    ConvertFrom-XToolLimit $_ | Add-Member -NotePropertyName name -NotePropertyValue $_.name -PassThru
+  })
+  return [pscustomobject]@{ S = (ConvertFrom-XToolLimit $xt.reading.session); W = (ConvertFrom-XToolLimit $xt.reading.weekly); XL = $XL; sub = $sub; ts = $takenAt }
+}
 
 # ---- 429 cooldown ----
 # Bounds keep a bogus Retry-After from parking the tray indefinitely, and a
@@ -224,8 +291,9 @@ function Write-Cache($obj) {
   try { $obj | ConvertTo-Json -Depth 8 | Set-Content -Path $CachePath -Encoding UTF8 } catch {}
 }
 
-# Publish a cooldown to both caches. The shared entry keeps the last good reading
-# peers draw from - only blockedUntil changes.
+# Publish a cooldown to every cache. The shared entries keep the last good reading
+# peers draw from - only blockedUntil changes. The cross-tool file is re-read first:
+# Loop's engine may have written it since we looked.
 function Publish-Cooldown([double]$until, $cache, $sh) {
   $c = if ($cache) { $cache } else { [pscustomobject]@{ ts = 0 } }
   Write-Cache ([pscustomobject]@{ sub = $c.sub; S = $c.S; W = $c.W; XL = $c.XL; ts = $c.ts; blockedUntil = $until })
@@ -233,6 +301,11 @@ function Publish-Cooldown([double]$until, $cache, $sh) {
     $o = if ($sh) { $sh } else { [pscustomobject]@{ ts = 0 } }
     Write-Shared ([pscustomobject]@{ v = 1; ts = $o.ts; sub = $o.sub; S = $o.S; W = $o.W; XL = $o.XL; blockedUntil = $until })
   }
+  $x = Read-XTool
+  $merged = [ordered]@{ ts = 0 }
+  if ($x) { foreach ($pr in $x.PSObject.Properties) { $merged[$pr.Name] = $pr.Value } }
+  $merged['blockedUntil'] = $until
+  Write-Atomic $XToolPath ([pscustomobject]$merged)
 }
 
 # ---- tray plumbing ----
@@ -317,6 +390,16 @@ function Update-Bar {
     return
   }
 
+  # ...or another tool on this PC (the MCP server, Loop's engine) - same rules.
+  $xt = Read-XTool
+  $haveXT = $xt -and ([double]$xt.ts -gt 0) -and $xt.reading -and $xt.reading.ok -and ($xt.reading.session -or $xt.reading.weekly)
+  $xv = if ($haveXT) { Get-XToolView $xt (Get-XToolTakenAt $xt) $cache.sub } else { $null }
+  if ((-not $Force) -and $haveXT -and ((Get-Age $xv.ts) -lt $SharedTtlMs)) {
+    Write-Cache ([pscustomobject]@{ sub = $xv.sub; S = $xv.S; W = $xv.W; XL = $xv.XL; ts = $xv.ts; blockedUntil = $xt.blockedUntil })
+    Render $xv.S $xv.W $xv.XL $xv.sub $null
+    return
+  }
+
   # newest of whatever we can still draw from - a peer's reading beats a blank icon,
   # including on a PC that was never signed in
   $fb = $null
@@ -324,9 +407,10 @@ function Update-Bar {
   if ($haveShared -and ((-not $fb) -or ([double]$sh.ts -gt $fb.ts))) {
     $fb = [pscustomobject]@{ S = $sh.S; W = $sh.W; XL = $sh.XL; sub = $sh.sub; ts = [double]$sh.ts }
   }
+  if ($haveXT -and ((-not $fb) -or ($xv.ts -gt $fb.ts))) { $fb = $xv }
 
-  # Cooldown in force (ours or a peer's): draw what we have and make no request.
-  $wait = [math]::Max([double](Get-Wait $cache.blockedUntil), [double](Get-Wait $sh.blockedUntil))
+  # Cooldown in force (ours, a peer's, or a local tool's): draw what we have and make no request.
+  $wait = [math]::Max([math]::Max([double](Get-Wait $cache.blockedUntil), [double](Get-Wait $sh.blockedUntil)), [double](Get-Wait $xt.blockedUntil))
   if ($wait -gt 0) {
     $note = "rate-limited - retrying in $(Get-WaitText $wait)"
     if ($fb) {
@@ -368,6 +452,8 @@ function Update-Bar {
     Write-Cache ([pscustomobject]@{ sub = $oauth.subscriptionType; S = $S; W = $W; XL = $XL; ts = $nowMs })
     # Publish for the other machines/apps sharing this account's request budget.
     Write-Shared ([pscustomobject]@{ v = 1; ts = $nowMs; sub = $oauth.subscriptionType; S = $S; W = $W; XL = $XL })
+    # ...and for the tools on this PC, so they reuse this fetch instead of making their own.
+    Write-Atomic $XToolPath ([pscustomobject]@{ reading = (New-XToolReading $S $W $XL $oauth.subscriptionType $nowMs); ts = $nowMs })
     Render $S $W $XL $oauth.subscriptionType $null
   }
   catch {

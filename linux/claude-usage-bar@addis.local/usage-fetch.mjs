@@ -67,14 +67,31 @@ function readShared() {
     try { const o = JSON.parse(fs.readFileSync(p, 'utf8')); if (o && o.v === 1 && typeof o.ts === 'number') return o; } catch {}
     return null;
 }
-function writeShared(o) {
-    const p = sharedPath(); if (!p) return;
+function writeShared(o) { const p = sharedPath(); if (p) writeAtomic(p, o); }
+function writeAtomic(p, o) {
+    const t = `${p}.tmp${process.pid}`;
     try {
         fs.mkdirSync(path.dirname(p), {recursive: true});
-        const t = `${p}.tmp${process.pid}`;
         fs.writeFileSync(t, JSON.stringify(o));
         fs.renameSync(t, p);   // atomic, so a syncing peer never reads a half-written file
-    } catch {}
+    } catch { try { fs.rmSync(t, {force: true}); } catch {} }
+}
+
+// ---- cross-tool cache (the tools on THIS machine) ----
+// Loop Engineering and the MCP server (mcp/usage-core.mjs) share usage through one local
+// file, {reading, ts, blockedUntil}. The bar joins it too. Above all it needs the cooldown:
+// a consumer that can't see another's 429 takes turns with it restarting the hour-long
+// penalty, even when both honour Retry-After, and neither ever gets through. The file is
+// per-machine; the shared file above is what crosses machines.
+const XTOOL = process.env.CLAUDE_USAGE_CACHE
+    || path.join(os.homedir(), '.local', 'share', 'claude-usage', 'usage-cache.json');
+function readXTool() { try { const o = JSON.parse(fs.readFileSync(XTOOL, 'utf8')); if (o && typeof o === 'object') return o; } catch {} return null; }
+// When the reading was taken. Older Loop builds re-stamped a cached reading `ts: now`, so
+// take the earlier of ts and the reading's own fetchedAt — a re-dated week-old reading
+// must not pass for fresh.
+function xtoolTakenAt(xt) {
+    const f = Date.parse(xt.reading?.fetchedAt ?? '');
+    return Number.isFinite(f) ? Math.min(xt.ts, f) : xt.ts;
 }
 // Another machine's clock may run ahead of ours; treat "written in the future" as fresh.
 const ageOf = (ts) => Math.max(0, Date.now() - ts);
@@ -82,11 +99,56 @@ const ageOf = (ts) => Math.max(0, Date.now() - ts);
 const waitFor = (until) => (typeof until === 'number' && until > Date.now())
     ? Math.min(until - Date.now(), COOLDOWN_MAX_MS) : 0;
 
-// Publish the cooldown to both caches. The shared entry is merged, never replaced,
-// so peers keep the last good reading to draw from while everyone sits it out.
+// Publish the cooldown to every cache. The shared entries are merged, never replaced,
+// so peers keep the last good reading to draw from while everyone sits it out. The
+// cross-tool file is re-read first: Loop's engine may have written it since we looked.
 function recordCooldown(until, cache, sh) {
     writeCache({...(cache || {ts: 0, payload: null}), blockedUntil: until});
     if (sharedPath()) writeShared({...(sh || {v: 1, ts: 0}), v: 1, blockedUntil: until});
+    writeAtomic(XTOOL, {...(readXTool() || {ts: 0}), blockedUntil: until});
+}
+
+// Same, from a cross-tool reading: usage-core's shape (camelCase resetsAt, scoped[] with a
+// name). Loop Engineering's readings carry no scoped caps, so a copy it wrote shows the
+// session and weekly bars only, until the next full reading.
+function payloadFromXTool(xt, takenAt) {
+    const r = xt.reading;
+    const mk = (x, kind, group, name) => x && ({
+        kind, group,
+        label: kind === 'session' ? 'Session (5h)' : kind === 'weekly_all' ? 'Weekly (all)' : `Weekly · ${name || 'scoped'}`,
+        scopeName: kind === 'weekly_scoped' ? (name || 'scoped') : null,
+        percent: Math.round(x.percent ?? 0),
+        resetsAt: x.resetsAt ?? null,
+        severity: x.severity ?? 'normal',
+        isActive: false,
+    });
+    const limits = [
+        mk(r.session, 'session', 'session'),
+        mk(r.weekly, 'weekly_all', 'weekly'),
+        ...(r.scoped || []).map(l => mk(l, 'weekly_scoped', 'weekly', l.name)),
+    ].filter(Boolean);
+    return {
+        ok: true, fetchedAt: new Date(takenAt).toISOString(), subscription: sub || r.subscription || null,
+        session: limits.find(l => l.kind === 'session') || limits[0] || null,
+        limits, credits: null, fromSharedCache: true, sharedAgeSec: ageSec(takenAt),
+    };
+}
+
+// The reading as usage-core writes it (its `norm`), for the tools sharing the cross-tool file.
+function xtoolReading(limits, now) {
+    const norm = (l) => l ? {
+        percent: l.percent, resetsAt: l.resetsAt,
+        resetsInMinutes: l.resetsAt ? Math.max(0, Math.round((new Date(l.resetsAt) - now) / 60000)) : null,
+        severity: l.severity,
+    } : null;
+    return {
+        ok: true, subscription: sub || null, fetchedAt: new Date(now).toISOString(),
+        session: norm(limits.find(l => l.kind === 'session')),
+        weekly: norm(limits.find(l => l.kind === 'weekly_all')),
+        scoped: limits.filter(l => l.kind === 'weekly_scoped')
+            .map(l => ({...norm(l), name: l.scopeName || 'scoped'}))
+            .sort((a, b) => b.percent - a.percent),
+    };
 }
 
 // Rebuild this extension's payload shape from a shared entry. Countdowns are
@@ -155,10 +217,13 @@ const RANK = {session: 0, daily: 1, weekly_all: 2, weekly_scoped: 3};
 
 const cache = readCache();
 const sh = readShared();
+const xt = readXTool();
 // A cache written by an older version (or by a cooldown with nothing cached yet)
 // has no payload — usable only as a cooldown record.
 const haveCache = !!(cache && cache.payload && cache.ts > 0);
 const haveShared = !!(sh && sh.ts > 0 && (sh.S || sh.W));
+const haveXTool = !!(xt && typeof xt.ts === 'number' && xt.ts > 0 && xt.reading?.ok && (xt.reading.session || xt.reading.weekly));
+const xtAt = haveXTool ? xtoolTakenAt(xt) : 0;
 
 // Throttle guard: a recent success is reused without touching the API.
 if (!FORCE && haveCache && ageOf(cache.ts) < THROTTLE_MS) { out({...cache.payload}); process.exit(0); }
@@ -171,15 +236,20 @@ if (!FORCE && haveShared && ageOf(sh.ts) < SHARED_TTL) {
     writeCache({ts: sh.ts, payload, blockedUntil: sh.blockedUntil});
     out(payload); process.exit(0);
 }
+// ...or another tool on this machine (Loop's engine, the MCP server).
+if (!FORCE && haveXTool && ageOf(xtAt) < SHARED_TTL) {
+    const payload = payloadFromXTool(xt, xtAt);
+    writeCache({ts: xtAt, payload, blockedUntil: xt.blockedUntil});
+    out(payload); process.exit(0);
+}
 // When the API is unavailable, draw from whichever copy was fetched most recently —
-// ours or a peer's. Preferring our own would show this machine's staler numbers while
-// a newer reading sat in the shared file, so the bars would disagree with each other.
-const freshest = () => {
-    const a = haveCache ? {ts: cache.ts, payload: cache.payload} : null;
-    const b = haveShared ? {ts: sh.ts, payload: payloadFromShared(sh)} : null;
-    if (a && b) return a.ts >= b.ts ? a : b;
-    return a || b || null;
-};
+// ours, a peer's, or another local tool's. Preferring our own would show this machine's
+// staler numbers while a newer reading sat elsewhere, so the bars would disagree.
+const freshest = () => [
+    haveCache ? {ts: cache.ts, payload: cache.payload} : null,
+    haveShared ? {ts: sh.ts, payload: payloadFromShared(sh)} : null,
+    haveXTool ? {ts: xtAt, payload: payloadFromXTool(xt, xtAt)} : null,
+].reduce((best, c) => (c && (!best || c.ts > best.ts) ? c : best), null);
 const serveFreshest = (note, extra) => {
     const f = freshest(); if (!f) return;
     out({...f.payload, stale: true, note, cacheAgeSec: ageSec(f.ts), ...extra}); process.exit(0);
@@ -187,7 +257,7 @@ const serveFreshest = (note, extra) => {
 
 // Cooldown: we (or a peer) were told to back off. Show what we have and, crucially,
 // make no request — each one during the penalty pushes the hour out again.
-const wait = Math.max(waitFor(cache?.blockedUntil), waitFor(sh?.blockedUntil));
+const wait = Math.max(waitFor(cache?.blockedUntil), waitFor(sh?.blockedUntil), waitFor(xt?.blockedUntil));
 if (wait > 0) {
     const extra = {rateLimited: true, retryInSec: Math.ceil(wait / 1000)};
     serveFreshest('rate-limited', extra);
@@ -275,6 +345,9 @@ try {
         W: flat(limits.find(l => l.kind === 'weekly_all')),
         XL: limits.filter(l => l.kind === 'weekly_scoped').map(l => ({...flat(l), name: l.scopeName || 'scoped'})),
     });
+    // ...and for the tools on this machine, so Loop's engine reuses this fetch instead of
+    // making its own. blockedUntil omitted: the budget is evidently back.
+    writeAtomic(XTOOL, {reading: xtoolReading(limits, now), ts: now});
     out(payload);
 } catch (e) {
     serveFreshest('offline');
