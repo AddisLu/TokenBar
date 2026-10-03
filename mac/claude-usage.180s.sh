@@ -41,6 +41,13 @@ const writeCache = (o) => { try { fs.mkdirSync(path.dirname(CACHE), {recursive:t
 // surfaces use. blockedUntil is a 429 cooldown: the limit is per-account, so one
 // machine's penalty has to park the others too.
 const SHARED_TTL = 240_000;   // matches THROTTLE_MS: one fetch per window, account-wide
+// A hub URL (e.g. http://raspberrypi:8787/usage.json, see hub/) can stand in for the file:
+// one machine on the tailnet polls Anthropic and serves its reading, the rest only read
+// it. A hub is never written to, and its reading is trusted for HUB_TTL, longer than a
+// peer file's, because it's meant to be the only consumer paying for fetches. This
+// machine fetches for itself only when the hub is unreachable or has gone quiet.
+const HUB_TTL = 600_000;
+const isHub = (p) => /^https?:\/\//i.test(p || '');
 const THROTTLE_MS = 240_000;  // reuse a recent success instead of re-hitting the API
 function sharedPath(){
   const e = (process.env.TOKENBAR_SHARED_CACHE || '').trim();
@@ -48,12 +55,17 @@ function sharedPath(){
   try { const p = fs.readFileSync(path.join(os.homedir(),'.config','claude-usage-bar','shared-cache-path'),'utf8').trim(); if (p) return p; } catch {}
   return null;
 }
-function readShared(){
+async function readShared(){
   const p = sharedPath(); if (!p) return null;
-  try { const o = JSON.parse(fs.readFileSync(p,'utf8')); if (o && o.v === 1 && typeof o.ts === 'number') return o; } catch {}
+  try {
+    const o = isHub(p)
+      ? await (await fetch(p, {signal: AbortSignal.timeout(3000)})).json()
+      : JSON.parse(fs.readFileSync(p,'utf8'));
+    if (o && o.v === 1 && typeof o.ts === 'number') return o;
+  } catch {}
   return null;
 }
-function writeShared(o){ const p = sharedPath(); if (p) writeAtomic(p, o); }
+function writeShared(o){ const p = sharedPath(); if (p && !isHub(p)) writeAtomic(p, o); }
 function writeAtomic(p, o){
   const t = `${p}.tmp${process.pid}`;
   try {
@@ -203,10 +215,10 @@ if (cache && cache.ts > 0 && ageOf(cache.ts) < THROTTLE_MS) render(cache.S, cach
 // Another machine may have already paid for this data — reuse it rather than
 // spending a second request against the shared account-level limit. Its ts is kept
 // verbatim so "cached Ns ago" stays honest and the next poll re-evaluates correctly.
-const sh = readShared();
+const sh = await readShared();
 if (!sub && sh?.sub) sub = sh.sub;   // peer knows the plan even if we have no creds
 const shHasData = !!(sh && sh.ts > 0 && (sh.S || sh.W));
-if (shHasData && ageOf(sh.ts) < SHARED_TTL) {
+if (shHasData && ageOf(sh.ts) < (isHub(sharedPath()) ? HUB_TTL : SHARED_TTL)) {
   writeCache({sub: sh.sub ?? sub, S: sh.S, W: sh.W, XL: sh.XL, ts: sh.ts, blockedUntil: sh.blockedUntil});
   render(sh.S, sh.W, sh.XL);
 }

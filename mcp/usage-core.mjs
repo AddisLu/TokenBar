@@ -21,19 +21,31 @@ export const HISTORY = path.join(os.homedir(), '.local', 'share', 'claude-usage-
 // status bars use. `blockedUntil` is a 429 cooldown published account-wide: the
 // limit is per-account, so one consumer's penalty has to park all of them.
 const SHARED_TTL = 240_000;
+// A hub URL (e.g. http://raspberrypi:8787/usage.json, see hub/) can stand in for the file:
+// one machine on the tailnet polls Anthropic and serves its reading, the rest only read
+// it. A hub is never written to, and its reading is trusted for HUB_TTL, longer than a
+// peer file's, because it's meant to be the only consumer paying for fetches. This
+// machine fetches for itself only when the hub is unreachable or has gone quiet.
+const HUB_TTL = 600_000;
+const isHub = (p) => /^https?:\/\//i.test(p || '');
 function sharedPath() {
     const e = (process.env.TOKENBAR_SHARED_CACHE || '').trim();
     if (e) return e;
     try { const p = fs.readFileSync(path.join(os.homedir(), '.config', 'claude-usage-bar', 'shared-cache-path'), 'utf8').trim(); if (p) return p; } catch {}
     return null;
 }
-function readShared() {
+async function readShared() {
     const p = sharedPath(); if (!p) return null;
-    try { const o = JSON.parse(fs.readFileSync(p, 'utf8')); if (o && o.v === 1 && typeof o.ts === 'number') return o; } catch {}
+    try {
+        const o = isHub(p)
+            ? await (await fetch(p, {signal: AbortSignal.timeout(3000)})).json()
+            : JSON.parse(fs.readFileSync(p, 'utf8'));
+        if (o && o.v === 1 && typeof o.ts === 'number') return o;
+    } catch {}
     return null;
 }
 function writeShared(o) {
-    const p = sharedPath(); if (!p) return;
+    const p = sharedPath(); if (!p || isHub(p)) return;
     try {
         fs.mkdirSync(path.dirname(p), {recursive: true});
         const t = `${p}.tmp${process.pid}`;
@@ -141,19 +153,23 @@ function pickToken() {
 export async function fetchUsage() {
     // Another machine (or the status bar on this one) may have already paid for this
     // data; reuse it rather than spending another request against the shared limit.
-    const sh = readShared();
+    const sh = await readShared();
     const xt = readXTool();
     const shHasData = !!(sh && sh.ts > 0 && (sh.S || sh.W));
     const xtHasData = !!(xt && xt.reading?.ok && typeof xt.ts === 'number');
     // Newest reading either cache can offer, whoever paid for it.
     const best = (() => {
-        const a = shHasData ? {ts: sh.ts, get: () => fromShared(sh)} : null;
-        const b = xtHasData ? {ts: xt.ts, get: () => ({...xt.reading, source: 'cache', fromSharedCache: true,
+        const a = shHasData ? {ts: sh.ts, ttl: isHub(sharedPath()) ? HUB_TTL : SHARED_TTL, get: () => fromShared(sh)} : null;
+        const b = xtHasData ? {ts: xt.ts, ttl: SHARED_TTL, get: () => ({...xt.reading, source: 'cache', fromSharedCache: true,
             cacheAgeSeconds: Math.round(ageOf(xt.ts) / 1000)})} : null;
         if (a && b) return a.ts >= b.ts ? a : b;
         return a || b || null;
     })();
-    if (best && ageOf(best.ts) < SHARED_TTL) return best.get();
+    // A hub's reading stays usable longer than the local file's, so check each copy
+    // against its own window rather than only the newest.
+    const fresh = [best, shHasData && {ts: sh.ts, ttl: isHub(sharedPath()) ? HUB_TTL : SHARED_TTL, get: () => fromShared(sh)}]
+        .find(c => c && ageOf(c.ts) < c.ttl);
+    if (fresh) return fresh.get();
     // Anything we can still answer from when the API is unavailable, at any age.
     const stale = () => (best ? best.get() : null);
 

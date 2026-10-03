@@ -56,18 +56,30 @@ const ageSec = (ts) => Math.round(ageOf(ts) / 1000);
 // four surfaces use. `blockedUntil` is the cooldown: one machine's 429 parks the
 // others too, since the limit they'd hit is the same account's.
 const SHARED_TTL = 240_000;   // matches THROTTLE_MS: one fetch per window, account-wide
+// A hub URL (e.g. http://raspberrypi:8787/usage.json, see hub/) can stand in for the file:
+// one machine on the tailnet polls Anthropic and serves its reading, the rest only read
+// it. A hub is never written to, and its reading is trusted for HUB_TTL, longer than a
+// peer file's, because it's meant to be the only consumer paying for fetches. This
+// machine fetches for itself only when the hub is unreachable or has gone quiet.
+const HUB_TTL = 600_000;
+const isHub = (p) => /^https?:\/\//i.test(p || '');
 function sharedPath() {
     const e = (process.env.TOKENBAR_SHARED_CACHE || '').trim();
     if (e) return e;
     try { const p = fs.readFileSync(path.join(os.homedir(), '.config', 'claude-usage-bar', 'shared-cache-path'), 'utf8').trim(); if (p) return p; } catch {}
     return null;
 }
-function readShared() {
+async function readShared() {
     const p = sharedPath(); if (!p) return null;
-    try { const o = JSON.parse(fs.readFileSync(p, 'utf8')); if (o && o.v === 1 && typeof o.ts === 'number') return o; } catch {}
+    try {
+        const o = isHub(p)
+            ? await (await fetch(p, {signal: AbortSignal.timeout(3000)})).json()
+            : JSON.parse(fs.readFileSync(p, 'utf8'));
+        if (o && o.v === 1 && typeof o.ts === 'number') return o;
+    } catch {}
     return null;
 }
-function writeShared(o) { const p = sharedPath(); if (p) writeAtomic(p, o); }
+function writeShared(o) { const p = sharedPath(); if (p && !isHub(p)) writeAtomic(p, o); }
 function writeAtomic(p, o) {
     const t = `${p}.tmp${process.pid}`;
     try {
@@ -216,7 +228,7 @@ function label(l) {
 const RANK = {session: 0, daily: 1, weekly_all: 2, weekly_scoped: 3};
 
 const cache = readCache();
-const sh = readShared();
+const sh = await readShared();
 const xt = readXTool();
 // A cache written by an older version (or by a cooldown with nothing cached yet)
 // has no payload — usable only as a cooldown record.
@@ -230,8 +242,10 @@ if (!FORCE && haveCache && ageOf(cache.ts) < THROTTLE_MS) { out({...cache.payloa
 
 // Another machine may have already paid for this data — reuse it rather than
 // spending a second request against the shared account-level limit. Its ts is kept
-// verbatim so the next poll re-evaluates freshness correctly.
-if (!FORCE && haveShared && ageOf(sh.ts) < SHARED_TTL) {
+// verbatim so the next poll re-evaluates freshness correctly. A hub's reading is used
+// even on `--force`: re-reading the hub *is* the refresh, and costs the account nothing.
+const sharedFresh = isHub(sharedPath()) ? ageOf(sh?.ts) < HUB_TTL : !FORCE && ageOf(sh?.ts) < SHARED_TTL;
+if (haveShared && sharedFresh) {
     const payload = payloadFromShared(sh);
     writeCache({ts: sh.ts, payload, blockedUntil: sh.blockedUntil});
     out(payload); process.exit(0);

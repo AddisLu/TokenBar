@@ -3,3 +3,4 @@
 /tmp/
 node_modules/
 mcp/node_modules/
+__pycache__/

@@ -1,7 +1,7 @@
 # tokenbar
 
 Show your **real Claude usage** — session (5h) and weekly limits with reset
-countdowns — right in your OS status bar, on **macOS, Linux, and Windows**.
+countdowns — right in your OS status bar, on **macOS, Linux, Windows, and Raspberry Pi OS**.
 
 The data comes from Anthropic's official `oauth/usage` endpoint — the same source
 as Claude Code's `/usage` command — so the percentages and reset times are the
@@ -28,8 +28,9 @@ is **account-level**, every device shows the same combined usage; no syncing nee
 | macOS | [SwiftBar](https://github.com/swiftbar/SwiftBar) menu-bar plugin | [`mac/`](mac/) |
 | Linux | GNOME Shell top-bar extension | [`linux/`](linux/) |
 | Windows | System-tray indicator (PowerShell) | [`windows/`](windows/) |
+| Raspberry Pi OS | wf-panel-pi tray icon (Python, StatusNotifierItem) | [`rpi/`](rpi/) |
 
-All three refresh every **180 s** and share the same behaviour, including
+All four bars refresh every **180 s** and share the same behaviour, including
 **rate-limit resilience**: they cache the last good result and keep drawing the bar
 (countdowns recomputed live) when the endpoint returns 429 / errors, and skip the API
 when the last success was very recent (< 240 s). So running the bar on several machines
@@ -88,8 +89,8 @@ echo "$HOME/Library/Mobile Documents/com~apple~CloudDocs/tokenbar-usage.json" \
 
 Or set `TOKENBAR_SHARED_CACHE` to the same path. Then whichever machine polls first
 pays for the fetch and the rest reuse it, so **total requests settle at roughly one
-per 240 s no matter how many machines you run** (instead of 20/hour each). All four
-surfaces — the three bars and the MCP server — read and write the same file.
+per 240 s no matter how many machines you run** (instead of 20/hour each). All five
+surfaces — the four bars and the MCP server — read and write the same file.
 
 Details worth knowing:
 - Freshness window is 240 s. The poll stays at 180 s so countdowns keep ticking, but the
@@ -108,6 +109,44 @@ Details worth knowing:
   usage from a peer's reading — handy for a work machine you don't run `claude` on.
 - Unset it and everything behaves exactly as it did before.
 
+## One hub for every machine (Tailscale)
+
+The shared file still lets every machine poll whenever it finds the file stale. With an
+always-on box on your tailnet (a Raspberry Pi is plenty) you can go one step further:
+**only the hub talks to Anthropic, and every other bar just reads it.**
+
+```bash
+cd hub && bash install-hub.sh        # on the hub (Linux + systemd)
+```
+
+That installs `tokenbar-hub` as a system service (starts at boot, no login needed). It runs
+the same `usage-fetch.mjs` every 5 minutes — ~12 requests/hour, the 429 cooldown still
+honoured — and serves the reading at `http://<hub>:8787/usage.json`, answering only
+Tailscale and loopback addresses. Then, on every other machine, **update TokenBar first** (older
+versions read the URL as a file path), and put the hub URL where a
+shared-cache path would go:
+
+```bash
+mkdir -p ~/.config/claude-usage-bar
+echo 'http://raspberrypi:8787/usage.json' > ~/.config/claude-usage-bar/shared-cache-path   # macOS / Linux
+```
+```powershell
+mkdir -Force "$env:USERPROFILE\.config\claude-usage-bar" >$null
+Set-Content "$env:USERPROFILE\.config\claude-usage-bar\shared-cache-path" 'http://raspberrypi:8787/usage.json'
+```
+
+(or set `TOKENBAR_SHARED_CACHE` to the URL). With a hub URL configured, a bar, the MCP
+server or Loop:
+- uses the hub's reading while it is under **10 minutes** old — "Refresh now" just
+  re-reads the hub, it doesn't go to the API;
+- never writes to the hub, and obeys the hub's `blockedUntil`, so one 429 parks everyone;
+- **fetches for itself only when the hub is unreachable (3 s timeout) or has gone quiet**,
+  with its usual 240 s throttle and cooldown.
+
+On the hub, use a long-lived token (`claude setup-token` → `~/.config/claude-usage-bar/token`):
+otherwise its Claude Code login expires ~8 h after Claude Code was last used there, and the
+bars quietly fall back to fetching for themselves.
+
 ### macOS
 ```bash
 cd mac && bash install-claude-usage-mac.sh
@@ -125,6 +164,19 @@ Installs + enables the GNOME extension, then reload the shell (X11: `Alt+F2` →
 Enter; Wayland: log out/in). Prereqs: Node.js and signed in to Claude Code (token
 read from `~/.claude/.credentials.json`).
 
+### Raspberry Pi OS (labwc / wf-panel-pi)
+```bash
+cd rpi && bash install-rpi.sh
+```
+Raspberry Pi OS's desktop is labwc + wf-panel-pi, not GNOME, so the `linux/` extension
+can't load there. This installs a tray icon instead — the session % over a session bar
+and a weekly bar (whichever weekly cap is highest); click it for reset times and
+"Refresh now". It runs the same `usage-fetch.mjs` as the GNOME extension (copied from
+`linux/` at install time), so caching, the 429 cooldown and the shared cache are identical.
+Starts at login via `~/.config/autostart/`. Prereqs: Node.js, `python3-gi`,
+`python3-cairo` (the installer apt-installs any that are missing) and signed in to
+Claude Code (token read from `~/.claude/.credentials.json`).
+
 ### Windows
 ```powershell
 cd windows
@@ -141,7 +193,7 @@ stays fresh. If a machine sits idle past the token's lifetime, the bar shows an 
 state until you next run Claude Code. (The standalone Claude desktop app uses separate
 auth and does **not** refresh this token.)
 
-All three bars also accept a **long-lived token** from `claude setup-token`, saved to
+All four bars also accept a **long-lived token** from `claude setup-token`, saved to
 `~/.config/claude-usage-bar/token` (Windows: `%USERPROFILE%\.config\claude-usage-bar\token`)
 or set as `CLAUDE_CODE_OAUTH_TOKEN`. It is used whenever the short-lived token is stale
 or missing, so it covers machines left idle for long stretches, and machines that are

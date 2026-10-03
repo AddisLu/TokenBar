@@ -77,6 +77,13 @@ New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
 # machine's penalty has to park the others too.
 $SharedTtlMs = 240000   # matches $ThrottleMs: one fetch per window, account-wide
 $ThrottleMs  = 240000   # reuse a recent success instead of re-hitting the API
+# A hub URL (e.g. http://raspberrypi:8787/usage.json, see hub/) can stand in for the file:
+# one machine on the tailnet polls Anthropic and serves its reading, the rest only read
+# it. A hub is never written to, and its reading is trusted for $HubTtlMs, longer than a
+# peer file's, because it's meant to be the only consumer paying for fetches. This PC
+# fetches for itself only when the hub is unreachable or has gone quiet.
+$HubTtlMs = 600000
+function Test-Hub([string]$p) { return [bool]($p -match '^https?://') }
 function Get-SharedPath {
   if ($env:TOKENBAR_SHARED_CACHE -and $env:TOKENBAR_SHARED_CACHE.Trim()) { return $env:TOKENBAR_SHARED_CACHE.Trim() }
   $f = Join-Path $env:USERPROFILE '.config\claude-usage-bar\shared-cache-path'
@@ -86,12 +93,13 @@ function Get-SharedPath {
 function Read-Shared {
   $p = Get-SharedPath; if (-not $p) { return $null }
   try {
-    $o = Get-Content -Raw -Path $p -ErrorAction Stop | ConvertFrom-Json
+    $o = if (Test-Hub $p) { Invoke-RestMethod -Uri $p -TimeoutSec 3 -ErrorAction Stop }
+         else { Get-Content -Raw -Path $p -ErrorAction Stop | ConvertFrom-Json }
     if ($o.v -eq 1 -and $o.ts -ne $null) { return $o }
   } catch {}
   return $null
 }
-function Write-Shared($obj) { $p = Get-SharedPath; if ($p) { Write-Atomic $p $obj } }
+function Write-Shared($obj) { $p = Get-SharedPath; if ($p -and -not (Test-Hub $p)) { Write-Atomic $p $obj } }
 function Write-Atomic([string]$p, $obj) {
   $t = "$p.tmp$PID"
   try {
@@ -410,9 +418,13 @@ function Update-Bar {
   # Another machine may have already paid for this data - reuse it rather than
   # spending a second request against the shared account-level limit. Its ts is kept
   # verbatim so "cached Ns ago" stays honest and the next poll re-evaluates correctly.
+  # A hub's reading is used even on -Force: re-reading the hub *is* the refresh, and
+  # costs the account nothing.
   $sh = Read-Shared
   $haveShared = $sh -and ([double]$sh.ts -gt 0) -and ($sh.S -or $sh.W)
-  if ((-not $Force) -and $haveShared -and ((Get-Age ([double]$sh.ts)) -lt $SharedTtlMs)) {
+  $sharedFresh = if (Test-Hub (Get-SharedPath)) { $haveShared -and ((Get-Age ([double]$sh.ts)) -lt $HubTtlMs) }
+                 else { (-not $Force) -and $haveShared -and ((Get-Age ([double]$sh.ts)) -lt $SharedTtlMs) }
+  if ($sharedFresh) {
     Write-Cache ([pscustomobject]@{ sub = $sh.sub; S = $sh.S; W = $sh.W; XL = $sh.XL; ts = $sh.ts; blockedUntil = $sh.blockedUntil })
     Render $sh.S $sh.W $sh.XL $sh.sub $null
     return
