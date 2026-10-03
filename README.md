@@ -50,6 +50,27 @@ deadline is written to the caches as `blockedUntil`, so one machine's 429 parks 
 others too; a success clears it. The wait is clamped to 1–65 min, so a bogus header
 can't park the bar indefinitely.
 
+### One cooldown for every tool on the machine
+
+Honouring `Retry-After` is not enough if each consumer only honours its *own*. Two
+tools that can't see each other's cooldown lock the account out between them, because
+each one's retry lands inside the hour the other just restarted:
+
+```
+00:00  tool A  → 429, waits until 01:00
+00:20  bar     → 429, penalty restarts, waits until 01:20
+01:00  tool A  → still inside the penalty → 429, restarts it again …
+```
+
+A bar running beside a Loop Engineering engine can sit in this loop indefinitely.
+So on each machine the bars also read and write `~/.local/share/claude-usage/usage-cache.json`
+(override with `$CLAUDE_USAGE_CACHE`). The MCP server and Loop Engineering already share
+usage through that `{reading, ts, blockedUntil}` file. A 429 seen by any of them parks all
+of them, and a fetch by any of them serves the rest for the next 240 s. The file only
+covers one machine. For tools on different machines, point them all at the shared file
+below. Loop Engineering reads that file through the MCP server's `usage-core.mjs`, so set
+its `TOKENBAR_MCP_DIR`.
+
 ## Sharing one fetch across machines
 
 That local cache is per-machine, so it makes each bar *degrade gracefully* — it does
@@ -120,9 +141,19 @@ stays fresh. If a machine sits idle past the token's lifetime, the bar shows an 
 state until you next run Claude Code. (The standalone Claude desktop app uses separate
 auth and does **not** refresh this token.)
 
-The Linux version additionally accepts a long-lived token from `claude setup-token`,
-placed in `~/.config/claude-usage-bar/token`, used only as a fallback when the
-short-lived token is stale — handy for machines left idle for long stretches.
+All three bars also accept a **long-lived token** from `claude setup-token`, saved to
+`~/.config/claude-usage-bar/token` (Windows: `%USERPROFILE%\.config\claude-usage-bar\token`)
+or set as `CLAUDE_CODE_OAUTH_TOKEN`. It is used whenever the short-lived token is stale
+or missing, so it covers machines left idle for long stretches, and machines that are
+**not signed in** to Claude Code at all — for example a Mac that runs Claude Code on
+API billing. The bar then shows `Not signed in … showing shared data` until you either
+sign in (`claude` → `/login` with the subscription account) or save that token:
+
+```bash
+claude setup-token                      # on any machine signed in with the subscription
+mkdir -p ~/.config/claude-usage-bar
+pbpaste > ~/.config/claude-usage-bar/token   # paste the token it printed; chmod 600 it
+```
 
 ## Notes
 - **Read-only**: every version only *reads* the credentials file / Keychain — it

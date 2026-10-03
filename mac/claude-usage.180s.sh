@@ -53,14 +53,34 @@ function readShared(){
   try { const o = JSON.parse(fs.readFileSync(p,'utf8')); if (o && o.v === 1 && typeof o.ts === 'number') return o; } catch {}
   return null;
 }
-function writeShared(o){
-  const p = sharedPath(); if (!p) return;
+function writeShared(o){ const p = sharedPath(); if (p) writeAtomic(p, o); }
+function writeAtomic(p, o){
+  const t = `${p}.tmp${process.pid}`;
   try {
     fs.mkdirSync(path.dirname(p), {recursive:true});
-    const t = `${p}.tmp${process.pid}`;
     fs.writeFileSync(t, JSON.stringify(o));
     fs.renameSync(t, p);   // atomic, so a syncing peer never reads a half-written file
-  } catch {}
+  } catch { try { fs.rmSync(t, {force:true}); } catch {} }
+}
+
+// ---- cross-tool cache (the tools on THIS machine) ----
+// The MCP server (mcp/usage-core.mjs) and Loop Engineering share usage through one local
+// file, {reading, ts, blockedUntil}; the plugin joins it. Above all it needs the cooldown:
+// a consumer that can't see another's 429 takes turns with it restarting the hour-long
+// penalty, even when both honour Retry-After. Per-machine; the file above crosses machines.
+const XTOOL = process.env.CLAUDE_USAGE_CACHE || path.join(os.homedir(),'.local','share','claude-usage','usage-cache.json');
+function readXTool(){ try { const o = JSON.parse(fs.readFileSync(XTOOL,'utf8')); if (o && typeof o === 'object') return o; } catch {} return null; }
+// When the reading was taken. Older Loop builds re-stamped a cached reading `ts: now`, so
+// take the earlier of ts and its own fetchedAt — a re-dated old reading must not pass for fresh.
+function xtoolTakenAt(xt){ const f = Date.parse(xt.reading?.fetchedAt ?? ''); return Number.isFinite(f) ? Math.min(xt.ts, f) : xt.ts; }
+// usage-core's reading shape (camelCase resetsAt, scoped[] with a name) <-> S/W/XL here
+const fromXT = (x) => x && {percent: x.percent, resets_at: x.resetsAt ?? null, severity: x.severity ?? 'normal'};
+function toXT(S, W, XL, now){
+  const norm = (x) => x ? {percent: Math.round(x.percent ?? 0), resetsAt: x.resets_at ?? null,
+    resetsInMinutes: x.resets_at ? Math.max(0, Math.round((new Date(x.resets_at) - now) / 60000)) : null,
+    severity: x.severity ?? 'normal'} : null;
+  return {ok: true, subscription: sub || null, fetchedAt: new Date(now).toISOString(), session: norm(S), weekly: norm(W),
+    scoped: (XL || []).map(l => ({...norm(l), name: l.name})).sort((a, b) => b.percent - a.percent)};
 }
 // Another machine's clock may run ahead of ours; treat "written in the future" as fresh
 // rather than as a wildly stale entry.
@@ -86,10 +106,26 @@ function cooldownFrom(res){
 const waitFor = (until) => (typeof until === 'number' && until > Date.now())
   ? Math.min(until - Date.now(), COOLDOWN_MAX_MS) : 0;
 
-// A missing token is not fatal here — the shared cache is consulted first (below), so
-// a Mac that never signs in can still display a peer's reading. Checked before fetching.
-let tok, sub;
-try { const c = JSON.parse(process.env.CLAUDE_CREDS || '').claudeAiOauth; tok = c.accessToken; sub = c.subscriptionType; } catch {}
+// Token priority (same as the Linux fetcher):
+//  1. Claude Code's short-lived session token (credentials file / Keychain) while it is
+//     still fresh — renewed by normal Claude Code use on this Mac
+//  2. a long-lived token from `claude setup-token`, saved to ~/.config/claude-usage-bar/token
+//     (or in $CLAUDE_CODE_OAUTH_TOKEN) — for a Mac that isn't signed in to Claude Code, or
+//     runs it on API billing, where nothing ever refreshes the session token
+//  3. the session token even if stale (the server has the final say)
+// A missing token is not fatal here — the caches are consulted first (below), so a Mac
+// that never signs in can still display a peer's reading. Checked before fetching.
+const TOKEN_FILE = path.join(os.homedir(), '.config', 'claude-usage-bar', 'token');
+let tok, tokSource, sub, credTok, credExp, longTok;
+try { const c = JSON.parse(process.env.CLAUDE_CREDS || '').claudeAiOauth; credTok = c.accessToken; credExp = c.expiresAt; sub = c.subscriptionType; } catch {}
+try { const t = fs.readFileSync(TOKEN_FILE, 'utf8').trim(); if (t) longTok = t; } catch {}
+if (!longTok && process.env.CLAUDE_CODE_OAUTH_TOKEN) longTok = process.env.CLAUDE_CODE_OAUTH_TOKEN.trim();
+if (credTok && credExp && Date.now() < credExp - 60000) { tok = credTok; tokSource = 'session'; }
+else if (longTok) { tok = longTok; tokSource = 'longlived'; }
+else if (credTok) { tok = credTok; tokSource = 'session'; }
+const authHint = tokSource === 'longlived'
+  ? 'Long-lived token expired — run: claude setup-token'
+  : 'Token expired — run Claude Code once';
 
 // ---- tiny PNG encoder (RGBA) ----
 function crc32(buf){let c=~0;for(let i=0;i<buf.length;i++){c^=buf[i];for(let k=0;k<8;k++)c=(c>>>1)^(0xEDB88320&-(c&1));}return ~c>>>0;}
@@ -175,23 +211,36 @@ if (shHasData && ageOf(sh.ts) < SHARED_TTL) {
   render(sh.S, sh.W, sh.XL);
 }
 
+// ...or another tool on this machine (the MCP server, Loop's engine) — same rules.
+const xt = readXTool();
+const xtHasData = !!(xt && typeof xt.ts === 'number' && xt.ts > 0 && xt.reading?.ok && (xt.reading.session || xt.reading.weekly));
+const xtView = () => ({S: fromXT(xt.reading.session), W: fromXT(xt.reading.weekly),
+  XL: (xt.reading.scoped || []).map(l => ({...fromXT(l), name: l.name})), ts: xtoolTakenAt(xt)});
+if (!sub && xtHasData && xt.reading.subscription) sub = xt.reading.subscription;
+if (xtHasData && ageOf(xtoolTakenAt(xt)) < SHARED_TTL) {
+  const v = xtView();
+  writeCache({sub, S: v.S, W: v.W, XL: v.XL, ts: v.ts, blockedUntil: xt.blockedUntil});
+  render(v.S, v.W, v.XL);
+}
+
 // newest of whatever we can still draw from when the API is unavailable
-const fallback = () => {
-  const a = (cache && cache.ts > 0 && (cache.S || cache.W)) ? {S:cache.S, W:cache.W, XL:cache.XL, ts:cache.ts} : null;
-  const b = shHasData ? {S:sh.S, W:sh.W, XL:sh.XL, ts:sh.ts} : null;
-  if (a && b) return a.ts >= b.ts ? a : b;
-  return a || b || null;
-};
-// Publish a cooldown to both caches. The shared entry is merged, never replaced, so
-// peers keep the last good reading to draw from while everyone sits it out.
+const fallback = () => [
+  (cache && cache.ts > 0 && (cache.S || cache.W)) ? {S:cache.S, W:cache.W, XL:cache.XL, ts:cache.ts} : null,
+  shHasData ? {S:sh.S, W:sh.W, XL:sh.XL, ts:sh.ts} : null,
+  xtHasData ? xtView() : null,
+].reduce((best, c) => (c && (!best || c.ts > best.ts) ? c : best), null);
+// Publish a cooldown to every cache. The shared entries are merged, never replaced, so
+// peers keep the last good reading to draw from while everyone sits it out. The
+// cross-tool file is re-read first: Loop's engine may have written it since we looked.
 function recordCooldown(until){
   writeCache({...(cache || {ts:0}), sub: cache?.sub ?? sub, blockedUntil: until});
   if (sharedPath()) writeShared({...(sh || {v:1, ts:0}), v:1, blockedUntil: until});
+  writeAtomic(XTOOL, {...(readXTool() || {ts:0}), blockedUntil: until});
 }
 
 // Cooldown in force (ours or a peer's): draw what we have and make no request —
 // each one during the penalty pushes the hour out again.
-const wait = Math.max(waitFor(cache?.blockedUntil), waitFor(sh?.blockedUntil));
+const wait = Math.max(waitFor(cache?.blockedUntil), waitFor(sh?.blockedUntil), waitFor(xt?.blockedUntil));
 if (wait > 0) {
   const f = fallback();
   if (f) render(f.S, f.W, f.XL, coolNote(f.ts, wait));
@@ -201,8 +250,8 @@ if (wait > 0) {
 // Only now does a missing token matter — nothing above needed one.
 if (!tok) {
   const f = fallback();
-  if (f) render(f.S, f.W, f.XL, '⚠ Not signed in on this Mac — showing shared data');
-  bad('Not logged in to Claude Code');
+  if (f) render(f.S, f.W, f.XL, '⚠ Not signed in on this Mac — showing shared data (claude /login, or save a `claude setup-token` to ~/.config/claude-usage-bar/token)');
+  bad('Not signed in — run `claude` then /login, or save a `claude setup-token` to ~/.config/claude-usage-bar/token');
 }
 
 try {
@@ -212,8 +261,8 @@ try {
   });
   if (res.status===401||res.status===403) {
     const f = fallback();
-    if (f) render(f.S, f.W, f.XL, '⚠ Token expired — run Claude Code once');
-    bad('Token expired — run Claude Code once');
+    if (f) render(f.S, f.W, f.XL, `⚠ ${authHint}`);
+    bad(authHint);
   }
   if (res.status === 429) {
     const until = cooldownFrom(res);
@@ -241,6 +290,7 @@ try {
   // omitting blockedUntil clears any cooldown: the budget is evidently back
   writeCache({sub, S, W, XL, ts: now});
   writeShared({v:1, ts: now, sub, S, W, XL});
+  writeAtomic(XTOOL, {reading: toXT(S, W, XL, now), ts: now});   // the local tools reuse this fetch
   render(S, W, XL);
 } catch(e) {
   const f = fallback();
