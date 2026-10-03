@@ -39,9 +39,10 @@ $TokenFile = Join-Path $env:USERPROFILE '.config\claude-usage-bar\token'
 # Token priority (same as the Linux fetcher and the mac plugin):
 #  1. Claude Code's short-lived session token (credentials file) while it is still fresh -
 #     renewed by normal Claude Code use on this PC
-#  2. a long-lived token from `claude setup-token`, saved to $TokenFile (or in
-#     $env:CLAUDE_CODE_OAUTH_TOKEN) - for a PC that isn't signed in to Claude Code, or runs
-#     it on API billing, where nothing ever refreshes the session token
+#  2. a token saved to $TokenFile (or in $env:CLAUDE_CODE_OAUTH_TOKEN). Not one from
+#     `claude setup-token`: it carries only the inference scope and oauth/usage rejects it
+#     (403, user:profile). A PC that isn't signed in to Claude Code, or runs it on API
+#     billing, should read a hub or shared file instead.
 #  3. the session token even if stale (the server has the final say)
 function Get-Auth {
   $credTok = $null; $credExp = $null; $sub = $null
@@ -59,7 +60,7 @@ function Get-Auth {
   return $null
 }
 function Get-AuthHint($auth) {
-  if ($auth -and $auth.source -eq 'longlived') { return 'Long-lived token expired - run: claude setup-token' }
+  if ($auth -and $auth.source -eq 'longlived') { return "Saved token refused (a setup-token can't read usage) - delete $TokenFile, run Claude Code once" }
   return 'Token expired - run Claude Code once'
 }
 $CacheDir  = Join-Path $env:LOCALAPPDATA 'ClaudeUsageBar'
@@ -518,7 +519,7 @@ function Update-Bar {
       Render $fb.S $fb.W $fb.XL $fb.sub $note
     }
     elseif ($coolNote) { Show-Error $coolNote }
-    elseif (-not $auth) { Show-Error "Not signed in - run claude then /login, or save a claude setup-token to $TokenFile" }
+    elseif (-not $auth) { Show-Error "Not signed in - run claude then /login, or point this PC at a hub (shared-cache-path)" }
     elseif ($code -eq 401 -or $code -eq 403) { Show-Error (Get-AuthHint $auth) }
     elseif ($code) { Show-Error "HTTP $code" }
     else { Show-Error 'Network error' }

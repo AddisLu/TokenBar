@@ -137,7 +137,8 @@ function readCredsJson() {
     return null;
 }
 
-// Prefer the fresh short-lived session token; fall back to a long-lived setup-token.
+// Prefer the fresh short-lived session token; fall back to a saved token. (Not a
+// `claude setup-token` one: oauth/usage rejects it, 403 user:profile.)
 function pickToken() {
     const c = readCredsJson() || {};
     let longTok;
@@ -201,7 +202,9 @@ export async function fetchUsage() {
 
     if (res.status === 401 || res.status === 403)
         return stale() || {ok: false, error: 'auth-expired',
-            hint: source === 'longlived' ? 'Long-lived token expired — run `claude setup-token`.' : 'Token expired — run `claude` once to refresh.'};
+            hint: source === 'longlived'
+                ? "Saved token refused (a setup-token can't read usage) — delete ~/.config/claude-usage-bar/token and run `claude` once."
+                : 'Token expired — run `claude` once to refresh.'};
     if (res.status === 429) {
         // Park every consumer of this account, here and on the other machines.
         cooldownUntil = cooldownFrom(res);

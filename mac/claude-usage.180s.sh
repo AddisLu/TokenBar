@@ -121,9 +121,10 @@ const waitFor = (until) => (typeof until === 'number' && until > Date.now())
 // Token priority (same as the Linux fetcher):
 //  1. Claude Code's short-lived session token (credentials file / Keychain) while it is
 //     still fresh — renewed by normal Claude Code use on this Mac
-//  2. a long-lived token from `claude setup-token`, saved to ~/.config/claude-usage-bar/token
-//     (or in $CLAUDE_CODE_OAUTH_TOKEN) — for a Mac that isn't signed in to Claude Code, or
-//     runs it on API billing, where nothing ever refreshes the session token
+//  2. a token saved to ~/.config/claude-usage-bar/token (or in $CLAUDE_CODE_OAUTH_TOKEN).
+//     Not one from `claude setup-token`: it carries only the inference scope and
+//     oauth/usage rejects it (403, user:profile). A Mac that isn't signed in to Claude
+//     Code, or runs it on API billing, should read a hub or shared file instead.
 //  3. the session token even if stale (the server has the final say)
 // A missing token is not fatal here — the caches are consulted first (below), so a Mac
 // that never signs in can still display a peer's reading. Checked before fetching.
@@ -136,7 +137,7 @@ if (credTok && credExp && Date.now() < credExp - 60000) { tok = credTok; tokSour
 else if (longTok) { tok = longTok; tokSource = 'longlived'; }
 else if (credTok) { tok = credTok; tokSource = 'session'; }
 const authHint = tokSource === 'longlived'
-  ? 'Long-lived token expired — run: claude setup-token'
+  ? "Saved token refused (a setup-token can't read usage) — delete ~/.config/claude-usage-bar/token, run Claude Code once"
   : 'Token expired — run Claude Code once';
 
 // ---- tiny PNG encoder (RGBA) ----
@@ -262,8 +263,8 @@ if (wait > 0) {
 // Only now does a missing token matter — nothing above needed one.
 if (!tok) {
   const f = fallback();
-  if (f) render(f.S, f.W, f.XL, '⚠ Not signed in on this Mac — showing shared data (claude /login, or save a `claude setup-token` to ~/.config/claude-usage-bar/token)');
-  bad('Not signed in — run `claude` then /login, or save a `claude setup-token` to ~/.config/claude-usage-bar/token');
+  if (f) render(f.S, f.W, f.XL, '⚠ Not signed in on this Mac — showing shared data (claude /login, or point it at a hub)');
+  bad('Not signed in — run `claude` then /login, or point this Mac at a hub (~/.config/claude-usage-bar/shared-cache-path)');
 }
 
 try {

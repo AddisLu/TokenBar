@@ -13,10 +13,11 @@ ask about later.
 
 ## Auth
 Read-only. Finds a token from (in order): the fresh short-lived session token in
-`~/.claude/.credentials.json`, the macOS Keychain (`Claude Code-credentials`), a
-long-lived `claude setup-token` in `~/.config/claude-usage-bar/token`, or the
-`CLAUDE_CODE_OAUTH_TOKEN` env var. Never writes the token back. If it 401s, run
-`claude` once on that machine.
+`~/.claude/.credentials.json`, the macOS Keychain (`Claude Code-credentials`), a token
+in `~/.config/claude-usage-bar/token`, or the `CLAUDE_CODE_OAUTH_TOKEN` env var. Never
+writes the token back. If it 401s, run `claude` once on that machine. A
+`claude setup-token` token won't work (it lacks the `user:profile` scope the usage
+endpoint needs); on a machine without a Claude Code login, use a hub or shared file.
 
 ## Rate limits
 `oauth/usage` is account-level rate-limited, and this server used to be the worst

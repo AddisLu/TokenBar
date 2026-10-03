@@ -187,11 +187,11 @@ function payloadFromShared(sh) {
     };
 }
 
-// Token priority:
-//  1. long-lived token from `claude setup-token`, saved to ~/.config/claude-usage-bar/token
-//     (never expires soon → no 8h refresh dance)
-//  2. CLAUDE_CODE_OAUTH_TOKEN env var
-//  3. short-lived OAuth accessToken from ~/.claude/.credentials.json (fallback)
+// Token sources: Claude Code's short-lived OAuth accessToken from
+// ~/.claude/.credentials.json, and a token saved to ~/.config/claude-usage-bar/token or
+// set in CLAUDE_CODE_OAUTH_TOKEN. Don't create the latter with `claude setup-token`: that
+// token carries only the inference scope and oauth/usage rejects it (403, user:profile).
+// For an idle or signed-out machine, point it at a hub or shared file instead.
 const TOKEN_FILE = path.join(os.homedir(), '.config', 'claude-usage-bar', 'token');
 let credTok, credExp, sub;
 try { const c = JSON.parse(fs.readFileSync(CRED, 'utf8')).claudeAiOauth; credTok = c.accessToken; credExp = c.expiresAt; sub = c.subscriptionType; } catch {}
@@ -200,18 +200,16 @@ try { const t = fs.readFileSync(TOKEN_FILE, 'utf8').trim(); if (t) longTok = t; 
 if (!longTok && process.env.CLAUDE_CODE_OAUTH_TOKEN) longTok = process.env.CLAUDE_CODE_OAUTH_TOKEN.trim();
 
 // Prefer the short-lived session token while it's still fresh (auto-renewed by
-// normal Claude Code use); fall back to the long-lived setup-token when it's stale
-// (idle machine). Active machines never depend on the long-lived token; idle ones
-// stay covered — self-healing with minimal upkeep.
+// normal Claude Code use); fall back to the saved token when it's stale.
 let tok, tokSource;
 if (credTok && credExp && Date.now() < credExp - 60000) { tok = credTok; tokSource = 'session'; }
 else if (longTok) { tok = longTok; tokSource = 'longlived'; }
 else if (credTok) { tok = credTok; tokSource = 'session'; }
 // NB: a missing token is not fatal here — the shared cache is consulted first, so a
 // machine that never signs in can still display a peer's reading. Checked below.
-// self-documenting: tells you exactly what to run if this token has expired
+// self-documenting: tells you exactly what to do if this token is refused
 const authHint = tokSource === 'longlived'
-    ? 'long-lived token expired → run: claude setup-token'
+    ? 'saved token refused (a setup-token can\'t read usage) — delete ~/.config/claude-usage-bar/token, run Claude Code once'
     : 'run Claude Code once to refresh';
 
 // friendly label + sort rank per limit kind
