@@ -106,10 +106,26 @@ function cooldownFrom(res){
 const waitFor = (until) => (typeof until === 'number' && until > Date.now())
   ? Math.min(until - Date.now(), COOLDOWN_MAX_MS) : 0;
 
-// A missing token is not fatal here — the shared cache is consulted first (below), so
-// a Mac that never signs in can still display a peer's reading. Checked before fetching.
-let tok, sub;
-try { const c = JSON.parse(process.env.CLAUDE_CREDS || '').claudeAiOauth; tok = c.accessToken; sub = c.subscriptionType; } catch {}
+// Token priority (same as the Linux fetcher):
+//  1. Claude Code's short-lived session token (credentials file / Keychain) while it is
+//     still fresh — renewed by normal Claude Code use on this Mac
+//  2. a long-lived token from `claude setup-token`, saved to ~/.config/claude-usage-bar/token
+//     (or in $CLAUDE_CODE_OAUTH_TOKEN) — for a Mac that isn't signed in to Claude Code, or
+//     runs it on API billing, where nothing ever refreshes the session token
+//  3. the session token even if stale (the server has the final say)
+// A missing token is not fatal here — the caches are consulted first (below), so a Mac
+// that never signs in can still display a peer's reading. Checked before fetching.
+const TOKEN_FILE = path.join(os.homedir(), '.config', 'claude-usage-bar', 'token');
+let tok, tokSource, sub, credTok, credExp, longTok;
+try { const c = JSON.parse(process.env.CLAUDE_CREDS || '').claudeAiOauth; credTok = c.accessToken; credExp = c.expiresAt; sub = c.subscriptionType; } catch {}
+try { const t = fs.readFileSync(TOKEN_FILE, 'utf8').trim(); if (t) longTok = t; } catch {}
+if (!longTok && process.env.CLAUDE_CODE_OAUTH_TOKEN) longTok = process.env.CLAUDE_CODE_OAUTH_TOKEN.trim();
+if (credTok && credExp && Date.now() < credExp - 60000) { tok = credTok; tokSource = 'session'; }
+else if (longTok) { tok = longTok; tokSource = 'longlived'; }
+else if (credTok) { tok = credTok; tokSource = 'session'; }
+const authHint = tokSource === 'longlived'
+  ? 'Long-lived token expired — run: claude setup-token'
+  : 'Token expired — run Claude Code once';
 
 // ---- tiny PNG encoder (RGBA) ----
 function crc32(buf){let c=~0;for(let i=0;i<buf.length;i++){c^=buf[i];for(let k=0;k<8;k++)c=(c>>>1)^(0xEDB88320&-(c&1));}return ~c>>>0;}
@@ -234,8 +250,8 @@ if (wait > 0) {
 // Only now does a missing token matter — nothing above needed one.
 if (!tok) {
   const f = fallback();
-  if (f) render(f.S, f.W, f.XL, '⚠ Not signed in on this Mac — showing shared data');
-  bad('Not logged in to Claude Code');
+  if (f) render(f.S, f.W, f.XL, '⚠ Not signed in on this Mac — showing shared data (claude /login, or save a `claude setup-token` to ~/.config/claude-usage-bar/token)');
+  bad('Not signed in — run `claude` then /login, or save a `claude setup-token` to ~/.config/claude-usage-bar/token');
 }
 
 try {
@@ -245,8 +261,8 @@ try {
   });
   if (res.status===401||res.status===403) {
     const f = fallback();
-    if (f) render(f.S, f.W, f.XL, '⚠ Token expired — run Claude Code once');
-    bad('Token expired — run Claude Code once');
+    if (f) render(f.S, f.W, f.XL, `⚠ ${authHint}`);
+    bad(authHint);
   }
   if (res.status === 429) {
     const until = cooldownFrom(res);

@@ -141,9 +141,19 @@ stays fresh. If a machine sits idle past the token's lifetime, the bar shows an 
 state until you next run Claude Code. (The standalone Claude desktop app uses separate
 auth and does **not** refresh this token.)
 
-The Linux version additionally accepts a long-lived token from `claude setup-token`,
-placed in `~/.config/claude-usage-bar/token`, used only as a fallback when the
-short-lived token is stale — handy for machines left idle for long stretches.
+All three bars also accept a **long-lived token** from `claude setup-token`, saved to
+`~/.config/claude-usage-bar/token` (Windows: `%USERPROFILE%\.config\claude-usage-bar\token`)
+or set as `CLAUDE_CODE_OAUTH_TOKEN`. It is used whenever the short-lived token is stale
+or missing, so it covers machines left idle for long stretches, and machines that are
+**not signed in** to Claude Code at all — for example a Mac that runs Claude Code on
+API billing. The bar then shows `Not signed in … showing shared data` until you either
+sign in (`claude` → `/login` with the subscription account) or save that token:
+
+```bash
+claude setup-token                      # on any machine signed in with the subscription
+mkdir -p ~/.config/claude-usage-bar
+pbpaste > ~/.config/claude-usage-bar/token   # paste the token it printed; chmod 600 it
+```
 
 ## Notes
 - **Read-only**: every version only *reads* the credentials file / Keychain — it

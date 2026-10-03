@@ -34,6 +34,34 @@ public class IconUtil {
 
 # ---- paths ----
 $CredPath  = Join-Path $env:USERPROFILE '.claude\.credentials.json'
+$TokenFile = Join-Path $env:USERPROFILE '.config\claude-usage-bar\token'
+
+# Token priority (same as the Linux fetcher and the mac plugin):
+#  1. Claude Code's short-lived session token (credentials file) while it is still fresh -
+#     renewed by normal Claude Code use on this PC
+#  2. a long-lived token from `claude setup-token`, saved to $TokenFile (or in
+#     $env:CLAUDE_CODE_OAUTH_TOKEN) - for a PC that isn't signed in to Claude Code, or runs
+#     it on API billing, where nothing ever refreshes the session token
+#  3. the session token even if stale (the server has the final say)
+function Get-Auth {
+  $credTok = $null; $credExp = $null; $sub = $null
+  try {
+    $o = (Get-Content -Raw -Path $CredPath -ErrorAction Stop | ConvertFrom-Json).claudeAiOauth
+    $credTok = $o.accessToken; $credExp = $o.expiresAt; $sub = $o.subscriptionType
+  } catch {}
+  $longTok = $null
+  try { $t = (Get-Content -Raw -Path $TokenFile -ErrorAction Stop).Trim(); if ($t) { $longTok = $t } } catch {}
+  if (-not $longTok -and $env:CLAUDE_CODE_OAUTH_TOKEN) { $longTok = $env:CLAUDE_CODE_OAUTH_TOKEN.Trim() }
+  $nowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+  if ($credTok -and $credExp -and ($nowMs -lt ([double]$credExp - 60000))) { return @{ tok = $credTok; sub = $sub; source = 'session' } }
+  if ($longTok) { return @{ tok = $longTok; sub = $sub; source = 'longlived' } }
+  if ($credTok) { return @{ tok = $credTok; sub = $sub; source = 'session' } }
+  return $null
+}
+function Get-AuthHint($auth) {
+  if ($auth -and $auth.source -eq 'longlived') { return 'Long-lived token expired - run: claude setup-token' }
+  return 'Token expired - run Claude Code once'
+}
 $CacheDir  = Join-Path $env:LOCALAPPDATA 'ClaudeUsageBar'
 $CachePath = Join-Path $CacheDir 'cache.json'
 New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
@@ -421,12 +449,11 @@ function Update-Bar {
     return
   }
 
+  $auth = Get-Auth
   try {
-    $creds = Get-Content -Raw -Path $CredPath -ErrorAction Stop | ConvertFrom-Json
-    $oauth = $creds.claudeAiOauth
-    if (-not $oauth.accessToken) { throw 'no token' }
+    if (-not $auth) { throw 'no token' }
     $headers = @{
-      Authorization        = "Bearer $($oauth.accessToken)"
+      Authorization        = "Bearer $($auth.tok)"
       'anthropic-beta'     = 'oauth-2025-04-20'
       'anthropic-version'  = '2023-06-01'
       Accept               = 'application/json'
@@ -449,12 +476,12 @@ function Update-Bar {
     })
 
     # a success clears the cooldown on both caches (blockedUntil simply omitted)
-    Write-Cache ([pscustomobject]@{ sub = $oauth.subscriptionType; S = $S; W = $W; XL = $XL; ts = $nowMs })
+    Write-Cache ([pscustomobject]@{ sub = $auth.sub; S = $S; W = $W; XL = $XL; ts = $nowMs })
     # Publish for the other machines/apps sharing this account's request budget.
-    Write-Shared ([pscustomobject]@{ v = 1; ts = $nowMs; sub = $oauth.subscriptionType; S = $S; W = $W; XL = $XL })
+    Write-Shared ([pscustomobject]@{ v = 1; ts = $nowMs; sub = $auth.sub; S = $S; W = $W; XL = $XL })
     # ...and for the tools on this PC, so they reuse this fetch instead of making their own.
-    Write-Atomic $XToolPath ([pscustomobject]@{ reading = (New-XToolReading $S $W $XL $oauth.subscriptionType $nowMs); ts = $nowMs })
-    Render $S $W $XL $oauth.subscriptionType $null
+    Write-Atomic $XToolPath ([pscustomobject]@{ reading = (New-XToolReading $S $W $XL $auth.sub $nowMs); ts = $nowMs })
+    Render $S $W $XL $auth.sub $null
   }
   catch {
     $code = $null
@@ -471,15 +498,16 @@ function Update-Bar {
     if ($fb) {
       $age = [int][math]::Round((Get-Age $fb.ts) / 1000)
       $note = if ($coolNote) { "$coolNote (cached ${age}s ago)" }
-              elseif (-not (Test-Path $CredPath)) { "not signed in on this PC - cached ${age}s ago" }
+              elseif (-not $auth) { "not signed in on this PC - cached ${age}s ago" }
+              elseif ($code -eq 401 -or $code -eq 403) { "$(Get-AuthHint $auth) - cached ${age}s ago" }
               elseif ($code) { "API $code - cached ${age}s ago" }
               else { "offline - cached ${age}s ago" }
       if ((Get-Age $fb.ts) -lt $QuietStaleMs) { $note = $null }
       Render $fb.S $fb.W $fb.XL $fb.sub $note
     }
     elseif ($coolNote) { Show-Error $coolNote }
-    elseif (-not (Test-Path $CredPath)) { Show-Error 'Not logged in to Claude Code on this PC' }
-    elseif ($code -eq 401 -or $code -eq 403) { Show-Error 'Token expired - run Claude Code once' }
+    elseif (-not $auth) { Show-Error "Not signed in - run claude then /login, or save a claude setup-token to $TokenFile" }
+    elseif ($code -eq 401 -or $code -eq 403) { Show-Error (Get-AuthHint $auth) }
     elseif ($code) { Show-Error "HTTP $code" }
     else { Show-Error 'Network error' }
   }
