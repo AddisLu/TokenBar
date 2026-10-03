@@ -143,9 +143,12 @@ server or Loop:
 - **fetches for itself only when the hub is unreachable (3 s timeout) or has gone quiet**,
   with its usual 240 s throttle and cooldown.
 
-On the hub, use a long-lived token (`claude setup-token` → `~/.config/claude-usage-bar/token`):
-otherwise its Claude Code login expires ~8 h after Claude Code was last used there, and the
-bars quietly fall back to fetching for themselves.
+The hub reads its own Claude Code login, which expires ~8 h after Claude Code last ran
+there — on an always-on box nobody uses, that would leave every bar fetching for itself.
+So `install-hub.sh` also installs `claude-token-keepalive.timer`: hourly it runs
+`claude auth status` (free) and, only if the token still expires within 90 minutes, a
+one-word Haiku prompt that makes Claude Code refresh it. The hub machine therefore needs
+Claude Code installed and signed in with the subscription account.
 
 ### macOS
 ```bash
@@ -193,19 +196,13 @@ stays fresh. If a machine sits idle past the token's lifetime, the bar shows an 
 state until you next run Claude Code. (The standalone Claude desktop app uses separate
 auth and does **not** refresh this token.)
 
-All four bars also accept a **long-lived token** from `claude setup-token`, saved to
-`~/.config/claude-usage-bar/token` (Windows: `%USERPROFILE%\.config\claude-usage-bar\token`)
-or set as `CLAUDE_CODE_OAUTH_TOKEN`. It is used whenever the short-lived token is stale
-or missing, so it covers machines left idle for long stretches, and machines that are
-**not signed in** to Claude Code at all — for example a Mac that runs Claude Code on
-API billing. The bar then shows `Not signed in … showing shared data` until you either
-sign in (`claude` → `/login` with the subscription account) or save that token:
-
-```bash
-claude setup-token                      # on any machine signed in with the subscription
-mkdir -p ~/.config/claude-usage-bar
-pbpaste > ~/.config/claude-usage-bar/token   # paste the token it printed; chmod 600 it
-```
+A long-lived token from `claude setup-token` does **not** work here: it carries only the
+inference scope, and `oauth/usage` answers it with `403 … scope requirement user:profile`.
+(The bars still read `~/.config/claude-usage-bar/token` / `CLAUDE_CODE_OAUTH_TOKEN` if
+present, but don't bother creating one.) For machines that sit idle, or that aren't signed
+in to Claude Code at all — say a Mac that runs Claude Code on API billing — point them at a
+[hub](#one-hub-for-every-machine-tailscale) or a shared file instead: they display the
+account's usage from that reading and never need a token of their own.
 
 ## Notes
 - **Read-only**: every version only *reads* the credentials file / Keychain — it

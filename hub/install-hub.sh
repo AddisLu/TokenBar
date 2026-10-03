@@ -15,15 +15,14 @@ PORT="${TOKENBAR_HUB_PORT:-8787}"
 [ -f "$FETCH_SRC" ] || { echo "!! Missing $FETCH_SRC"; exit 1; }
 NODE="$(command -v node)" || { echo "!! node not found — install nodejs first"; exit 1; }
 echo "• node: $($NODE -v)"
-[ -f "$HOME/.config/claude-usage-bar/token" ] \
-    && echo "• long-lived token: found" \
-    || echo "!! No long-lived token. The hub then relies on this machine's Claude Code login, which
-   expires ~8 h after Claude Code was last used here. On an always-on hub, run
-   'claude setup-token' and save the token to ~/.config/claude-usage-bar/token (chmod 600)."
+command -v claude >/dev/null 2>&1 && [ -f "$HOME/.claude/.credentials.json" ] \
+    && echo "• Claude Code login: found" \
+    || { echo "!! The hub needs Claude Code installed and signed in here — run 'claude' and /login."; exit 1; }
 
 # --- 1. install files ---
 mkdir -p "$DST"
-cp "$HERE/usage-hub.mjs" "$FETCH_SRC" "$DST"/
+cp "$HERE/usage-hub.mjs" "$HERE/claude-token-keepalive.sh" "$FETCH_SRC" "$DST"/
+chmod +x "$DST/claude-token-keepalive.sh"
 echo "• Installed to: $DST"
 
 # --- 2. system service: starts at boot, restarts on failure ---
@@ -51,7 +50,39 @@ sleep 2
 systemctl is-active --quiet tokenbar-hub.service && echo "• Service: running, enabled at boot" \
     || { echo "!! Service failed to start:"; sudo journalctl -u tokenbar-hub -n 20 --no-pager; exit 1; }
 
-# --- 3. this machine's own bars read the hub too (no second fetcher on the hub box) ---
+# --- 3. hourly login refresh ---
+# The hub reads this machine's Claude Code login, which expires ~8 h after Claude Code
+# last ran here. The timer keeps it fresh: `claude auth status` first (free), and a
+# one-word Haiku prompt only if the token still expires within 90 minutes.
+sudo tee /etc/systemd/system/claude-token-keepalive.service >/dev/null <<UNIT
+[Unit]
+Description=Keep Claude Code's login fresh for the TokenBar hub
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=$USER
+Environment=HOME=$HOME
+ExecStart=$DST/claude-token-keepalive.sh
+UNIT
+sudo tee /etc/systemd/system/claude-token-keepalive.timer >/dev/null <<'UNIT'
+[Unit]
+Description=Hourly Claude Code login refresh for the TokenBar hub
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now claude-token-keepalive.timer >/dev/null 2>&1
+echo "• Login refresh: hourly — $("$DST/claude-token-keepalive.sh")"
+
+# --- 4. this machine's own bars read the hub too (no second fetcher on the hub box) ---
 mkdir -p "$HOME/.config/claude-usage-bar"
 echo "http://127.0.0.1:$PORT/usage.json" > "$HOME/.config/claude-usage-bar/shared-cache-path"
 echo "• Local bars → http://127.0.0.1:$PORT/usage.json"
