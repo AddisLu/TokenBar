@@ -150,6 +150,20 @@ So `install-hub.sh` also installs `claude-token-keepalive.timer`: hourly it runs
 one-word Haiku prompt that makes Claude Code refresh it. The hub machine therefore needs
 Claude Code installed and signed in with the subscription account.
 
+#### Phone alerts from the hub
+
+```bash
+cd hub && bash install-alert.sh
+```
+Every 5 min, `usage-alert.mjs` checks the hub's reading and pushes a notification
+through [ntfy](https://ntfy.sh) when a limit — session, weekly or a per-model cap —
+crosses **80%** (normal) or **95%** (high priority), once per threshold per window. It
+also warns once if the hub's reading goes stale (say its login lapsed). It reads the
+hub's file, so it never calls the API. The installer picks a random topic (ntfy.sh
+topics are readable by anyone who knows the name) and sends a test push. Install the
+ntfy app and subscribe to the topic it prints. Change the thresholds with
+`TOKENBAR_ALERT_AT=70,90 bash install-alert.sh`.
+
 ### macOS
 ```bash
 cd mac && bash install-claude-usage-mac.sh
