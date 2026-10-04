@@ -361,7 +361,13 @@ function Set-Tray([IntPtr]$hicon, [string]$tip) {
   $notify.Icon = $icon
   if (-not [string]::IsNullOrEmpty($tip)) {
     if ($tip.Length -gt 127) { $tip = $tip.Substring(0, 127) }
-    $notify.Text = $tip
+    # .NET Framework (Windows PowerShell 5.1) caps NotifyIcon.Text at 63 chars, not 127;
+    # there, drop the "(resets …)" clocks and keep the countdowns.
+    try { $notify.Text = $tip } catch {
+      $tip = $tip -replace '  \(resets [^)]*\)', ''
+      if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
+      $notify.Text = $tip
+    }
   }
   if ($script:LastHicon -ne [IntPtr]::Zero) { [IconUtil]::DestroyIcon($script:LastHicon) | Out-Null }
   $script:LastHicon = $hicon
@@ -370,7 +376,7 @@ function Set-Tray([IntPtr]$hicon, [string]$tip) {
 # $XL holds the scoped weekly limits (per-model caps such as Fable). The icon has
 # room for one row, so it gets the most-consumed — that's the one that will cut you
 # off first — while the tooltip lists them all. Their lines are kept terse because
-# NotifyIcon.Text is capped at 127 chars.
+# NotifyIcon.Text is capped at 127 chars (63 on Windows PowerShell 5.1).
 function Render($S, $W, $XL, $sub, $note) {
   $sp = [int][math]::Round([double]$S.percent)
   $wp = [int][math]::Round([double]$W.percent)
