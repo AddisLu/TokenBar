@@ -94,6 +94,22 @@ function toXT(S, W, XL, now){
   return {ok: true, subscription: sub || null, fetchedAt: new Date(now).toISOString(), session: norm(S), weekly: norm(W),
     scoped: (XL || []).map(l => ({...norm(l), name: l.name})).sort((a, b) => b.percent - a.percent)};
 }
+// ...and publish that reading to the tools on THIS machine. The MCP server reads the hub
+// itself, but Loop Engineering's engine knows only the cross-tool file, so without this it
+// fetches for itself and its numbers drift from the hub's. The file is re-read here, as
+// recordCooldown does: Loop may have written it since we looked. Keep the reading's own ts
+// — re-dating it is the lie xtoolTakenAt() exists to catch — leave an entry that is already
+// newer alone, and carry a live blockedUntil over, or the other tools get a clean slate
+// in the middle of the hour-long penalty.
+function publishXTool(S, W, XL, takenAt, subscription, blockedUntil){
+  if (!(S || W)) return;
+  const cur = readXTool();
+  if (cur && cur.reading?.ok && typeof cur.ts === 'number' && xtoolTakenAt(cur) >= takenAt) return;
+  const until = [blockedUntil, cur?.blockedUntil].filter(b => waitFor(b) > 0).reduce((a, b) => Math.max(a, b), 0);
+  writeAtomic(XTOOL, {reading: {...toXT(S, W, XL, takenAt), subscription: subscription ?? sub ?? null},
+    ts: takenAt, ...(until ? {blockedUntil: until} : {})});
+}
+
 // Another machine's clock may run ahead of ours; treat "written in the future" as fresh
 // rather than as a wildly stale entry.
 const ageOf = (ts) => Math.max(0, Date.now() - ts);
@@ -211,7 +227,10 @@ const coolNote = (ts, wait) => quiet(ts) ? null
 
 const cache = readCache();
 // Throttle guard: reuse a recent success and don't hit the API.
-if (cache && cache.ts > 0 && ageOf(cache.ts) < THROTTLE_MS) render(cache.S, cache.W, cache.XL);
+if (cache && cache.ts > 0 && ageOf(cache.ts) < THROTTLE_MS) {
+  publishXTool(cache.S, cache.W, cache.XL, cache.ts, cache.sub, cache.blockedUntil);
+  render(cache.S, cache.W, cache.XL);
+}
 
 // Another machine may have already paid for this data — reuse it rather than
 // spending a second request against the shared account-level limit. Its ts is kept
@@ -221,6 +240,7 @@ if (!sub && sh?.sub) sub = sh.sub;   // peer knows the plan even if we have no c
 const shHasData = !!(sh && sh.ts > 0 && (sh.S || sh.W));
 if (shHasData && ageOf(sh.ts) < (isHub(sharedPath()) ? HUB_TTL : SHARED_TTL)) {
   writeCache({sub: sh.sub ?? sub, S: sh.S, W: sh.W, XL: sh.XL, ts: sh.ts, blockedUntil: sh.blockedUntil});
+  publishXTool(sh.S, sh.W, sh.XL, sh.ts, sh.sub, sh.blockedUntil);
   render(sh.S, sh.W, sh.XL);
 }
 

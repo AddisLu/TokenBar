@@ -179,6 +179,29 @@ function New-XToolReading($S, $W, $XL, $sub, [double]$nowMs) {
     scoped = $scoped
   }
 }
+
+# ...and publish that reading to the tools on THIS PC. The MCP server reads the hub itself,
+# but Loop Engineering's engine knows only the cross-tool file, so without this it fetches
+# for itself and its numbers drift from the hub's. The file is re-read here, as
+# Publish-Cooldown does: Loop may have written it since we looked. Keep the reading's own
+# ts - re-dating it is the lie Get-XToolTakenAt exists to catch - leave an entry that is
+# already newer alone, and carry a live blockedUntil over, or the other tools get a clean
+# slate in the middle of the hour-long penalty.
+function Publish-XTool($S, $W, $XL, $sub, [double]$takenAt, $blockedUntil) {
+  if (-not ($S -or $W)) { return }
+  $cur = Read-XTool
+  if ($cur -and $cur.reading -and $cur.reading.ok -and ([double]$cur.ts -gt 0) -and
+      ((Get-XToolTakenAt $cur) -ge $takenAt)) { return }
+  $until = 0.0
+  $curBlocked = if ($cur) { $cur.blockedUntil } else { $null }
+  foreach ($b in @($blockedUntil, $curBlocked)) {
+    if (((Get-Wait $b) -gt 0) -and ([double]$b -gt $until)) { $until = [double]$b }
+  }
+  $o = [ordered]@{ reading = (New-XToolReading $S $W $XL $sub $takenAt); ts = $takenAt }
+  if ($until -gt 0) { $o['blockedUntil'] = $until }
+  Write-Atomic $XToolPath ([pscustomobject]$o)
+}
+
 function Get-XToolView($xt, [double]$takenAt, $fallbackSub) {
   $sub = if ($xt.reading.subscription) { $xt.reading.subscription } else { $fallbackSub }
   $XL = @(@($xt.reading.scoped) | Where-Object { $_ } | ForEach-Object {
@@ -418,6 +441,7 @@ function Update-Bar {
 
   # throttle guard: reuse a recent success without hitting the API
   if ((-not $Force) -and $haveCache -and ((Get-Age ([double]$cache.ts)) -lt $ThrottleMs)) {
+    Publish-XTool $cache.S $cache.W $cache.XL $cache.sub ([double]$cache.ts) $cache.blockedUntil
     Render $cache.S $cache.W $cache.XL $cache.sub $null
     return
   }
@@ -433,6 +457,7 @@ function Update-Bar {
                  else { (-not $Force) -and $haveShared -and ((Get-Age ([double]$sh.ts)) -lt $SharedTtlMs) }
   if ($sharedFresh) {
     Write-Cache ([pscustomobject]@{ sub = $sh.sub; S = $sh.S; W = $sh.W; XL = $sh.XL; ts = $sh.ts; blockedUntil = $sh.blockedUntil })
+    Publish-XTool $sh.S $sh.W $sh.XL $sh.sub ([double]$sh.ts) $sh.blockedUntil
     Render $sh.S $sh.W $sh.XL $sh.sub $null
     return
   }
