@@ -167,12 +167,15 @@ function xtoolReading(limits, now) {
 // hub itself, but Loop Engineering's engine knows only the cross-tool file, so without
 // this it fetches for itself and its numbers drift from the hub's. The hub's own `ts` is
 // written verbatim — re-dating it `now` is exactly the lie xtoolTakenAt() exists to
-// catch. Skipped when another tool has already written something newer, and a live
-// cooldown rides along: dropping it would hand them a clean slate mid-penalty.
+// catch. The file is re-read rather than trusting the snapshot taken at startup —
+// recordCooldown() re-reads for the same reason: Loop's engine may have written it since
+// we looked. An entry already newer is left alone, and a live cooldown rides along:
+// dropping it would hand the other tools a clean slate mid-penalty.
 function publishXTool(limits, takenAt, subscription, blockedUntil) {
     if (!Array.isArray(limits) || !limits.length) return;
-    if (haveXTool && xtAt >= takenAt) return;
-    const until = [blockedUntil, xt?.blockedUntil].filter(b => waitFor(b) > 0)
+    const cur = readXTool();
+    if (cur && cur.reading?.ok && typeof cur.ts === 'number' && xtoolTakenAt(cur) >= takenAt) return;
+    const until = [blockedUntil, cur?.blockedUntil].filter(b => waitFor(b) > 0)
         .reduce((a, b) => Math.max(a, b), 0);
     writeAtomic(XTOOL, {
         reading: {...xtoolReading(limits, takenAt), subscription: subscription ?? sub ?? null},
