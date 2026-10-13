@@ -163,6 +163,23 @@ function xtoolReading(limits, now) {
     };
 }
 
+// ...and publish that reading to the tools on THIS machine. The MCP server reads the
+// hub itself, but Loop Engineering's engine knows only the cross-tool file, so without
+// this it fetches for itself and its numbers drift from the hub's. The hub's own `ts` is
+// written verbatim — re-dating it `now` is exactly the lie xtoolTakenAt() exists to
+// catch. Skipped when another tool has already written something newer, and a live
+// cooldown rides along: dropping it would hand them a clean slate mid-penalty.
+function publishXTool(limits, takenAt, subscription, blockedUntil) {
+    if (!Array.isArray(limits) || !limits.length) return;
+    if (haveXTool && xtAt >= takenAt) return;
+    const until = [blockedUntil, xt?.blockedUntil].filter(b => waitFor(b) > 0)
+        .reduce((a, b) => Math.max(a, b), 0);
+    writeAtomic(XTOOL, {
+        reading: {...xtoolReading(limits, takenAt), subscription: subscription ?? sub ?? null},
+        ts: takenAt, ...(until ? {blockedUntil: until} : {}),
+    });
+}
+
 // Rebuild this extension's payload shape from a shared entry. Countdowns are
 // recomputed from the absolute resetsAt by the panel, so age doesn't distort them.
 function payloadFromShared(sh) {
@@ -236,7 +253,10 @@ const haveXTool = !!(xt && typeof xt.ts === 'number' && xt.ts > 0 && xt.reading?
 const xtAt = haveXTool ? xtoolTakenAt(xt) : 0;
 
 // Throttle guard: a recent success is reused without touching the API.
-if (!FORCE && haveCache && ageOf(cache.ts) < THROTTLE_MS) { out({...cache.payload}); process.exit(0); }
+if (!FORCE && haveCache && ageOf(cache.ts) < THROTTLE_MS) {
+    publishXTool(cache.payload.limits, cache.ts, cache.payload.subscription, cache.blockedUntil);
+    out({...cache.payload}); process.exit(0);
+}
 
 // Another machine may have already paid for this data — reuse it rather than
 // spending a second request against the shared account-level limit. Its ts is kept
@@ -246,6 +266,7 @@ const sharedFresh = isHub(sharedPath()) ? ageOf(sh?.ts) < HUB_TTL : !FORCE && ag
 if (haveShared && sharedFresh) {
     const payload = payloadFromShared(sh);
     writeCache({ts: sh.ts, payload, blockedUntil: sh.blockedUntil});
+    publishXTool(payload.limits, sh.ts, sh.sub, sh.blockedUntil);
     out(payload); process.exit(0);
 }
 // ...or another tool on this machine (Loop's engine, the MCP server).
