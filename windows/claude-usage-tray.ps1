@@ -233,6 +233,14 @@ function Get-Wait($until) {
 function Get-WaitText([double]$ms) {
   return (Get-Countdown ([DateTimeOffset]::Now.AddMilliseconds($ms).ToString('o')))
 }
+# "45s" / "12m" / "3h" / "11d" for how old a cached reading is
+function Get-AgeText([double]$ms) {
+  $s = [int][math]::Round($ms / 1000)
+  if ($s -lt 60)    { return "${s}s" }
+  if ($s -lt 3600)  { return "$([int][math]::Floor($s / 60))m" }
+  if ($s -lt 86400) { return "$([int][math]::Floor($s / 3600))h" }
+  return "$([int][math]::Floor($s / 86400))d"
+}
 
 # ---- palette (matches the Mac plugin) ----
 $GREEN  = [System.Drawing.Color]::FromArgb(255, 46, 194, 126)
@@ -355,19 +363,23 @@ $miRefresh = $menu.Items.Add('Refresh')
 $miQuit    = $menu.Items.Add('Quit')
 $notify.ContextMenuStrip = $menu
 
+# NotifyIcon.Text is capped at 127 chars, but at 63 on .NET Framework (Windows
+# PowerShell 5.1), where a longer one throws. Probe which this runtime enforces.
+$TipMax = 127
+try { $notify.Text = 'x' * 100 } catch { $TipMax = 63 }
+$notify.Text = ''
+
 $script:LastHicon = [IntPtr]::Zero
-function Set-Tray([IntPtr]$hicon, [string]$tip) {
+# $tips: tooltip candidates, fullest first. The first that fits is shown; if none
+# does, the last is cut to fit.
+function Set-Tray([IntPtr]$hicon, [string[]]$tips) {
   $icon = [System.Drawing.Icon]::FromHandle($hicon)
   $notify.Icon = $icon
-  if (-not [string]::IsNullOrEmpty($tip)) {
-    if ($tip.Length -gt 127) { $tip = $tip.Substring(0, 127) }
-    # .NET Framework (Windows PowerShell 5.1) caps NotifyIcon.Text at 63 chars, not 127;
-    # there, drop the "(resets …)" clocks and keep the countdowns.
-    try { $notify.Text = $tip } catch {
-      $tip = $tip -replace '  \(resets [^)]*\)', ''
-      if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
-      $notify.Text = $tip
-    }
+  $tips = @($tips | Where-Object { $_ })
+  if ($tips.Count -gt 0) {
+    $tip = $tips | Where-Object { $_.Length -le $TipMax } | Select-Object -First 1
+    if (-not $tip) { $tip = $tips[-1].Substring(0, $TipMax) }
+    $notify.Text = $tip
   }
   if ($script:LastHicon -ne [IntPtr]::Zero) { [IconUtil]::DestroyIcon($script:LastHicon) | Out-Null }
   $script:LastHicon = $hicon
@@ -375,8 +387,10 @@ function Set-Tray([IntPtr]$hicon, [string]$tip) {
 
 # $XL holds the scoped weekly limits (per-model caps such as Fable). The icon has
 # room for one row, so it gets the most-consumed — that's the one that will cut you
-# off first — while the tooltip lists them all. Their lines are kept terse because
-# NotifyIcon.Text is capped at 127 chars (63 on Windows PowerShell 5.1).
+# off first — while the tooltip lists them all. The tooltip is built in shrinking
+# versions, because on Windows PowerShell 5.1 it has only 63 chars: first the reset
+# clocks go, then the "Claude - max" header, then the note is shortened and the
+# limits share one line.
 function Render($S, $W, $XL, $sub, $note) {
   $sp = [int][math]::Round([double]$S.percent)
   $wp = [int][math]::Round([double]$W.percent)
@@ -384,22 +398,40 @@ function Render($S, $W, $XL, $sub, $note) {
     @{ pct = $sp; col = (Get-Sev-Color $sp $S.severity) },
     @{ pct = $wp; col = (Get-Sev-Color $wp $W.severity) }
   )
-  $tip = "Claude$(if ($sub) { " - $sub" })`n" +
-         "Session $sp%  $(Get-Countdown $S.resets_at)  (resets $(Get-Clock $S.resets_at))`n" +
-         "Weekly $wp%  $(Get-Countdown $W.resets_at)  (resets $(Get-Clock $W.resets_at))"
+  $head = "Claude$(if ($sub) { " - $sub" })"
+  $full = @("Session $sp%  $(Get-Countdown $S.resets_at)  (resets $(Get-Clock $S.resets_at))",
+            "Weekly $wp%  $(Get-Countdown $W.resets_at)  (resets $(Get-Clock $W.resets_at))")
+  $short = @("Session $sp%  $(Get-Countdown $S.resets_at)", "Weekly $wp%  $(Get-Countdown $W.resets_at)")
+  $one = "S $sp%  W $wp%"
 
   $scoped = @(@($XL) | Where-Object { $_ } | Sort-Object { [double]$_.percent } -Descending)
   if ($scoped.Count -gt 0) {
     $xp = [int][math]::Round([double]$scoped[0].percent)
     $bars += @{ pct = $xp; col = (Get-Sev-Color $xp $scoped[0].severity) }
     foreach ($l in $scoped) {
-      $tip += "`n$($l.name) $([int][math]::Round([double]$l.percent))%  $(Get-Countdown $l.resets_at)"
+      $lp = [int][math]::Round([double]$l.percent)
+      $line = "$($l.name) $lp%  $(Get-Countdown $l.resets_at)"
+      $full += $line; $short += $line
+      $one += "  $($l.name) $lp%"
     }
   }
 
+  # "rate-limited - retrying in 16m (cached 11d ago)" -> "rate-limited, retry in 16m, 11d old"
+  $brief = if ($note) {
+    $note -replace '^rate-limited - retrying in ', 'rate-limited, retry in ' `
+          -replace ' \(cached (.+) ago\)$', ', $1 old' -replace ' - cached (.+) ago$', ', $1 old'
+  }
+  $pre  = if ($note)  { "$note`n" }  else { '' }
+  $preB = if ($brief) { "$brief`n" } else { '' }
+
   $hicon = New-BarIcon $bars
-  if ($note) { $tip = "$note`n$tip" }
-  Set-Tray $hicon $tip
+  Set-Tray $hicon @(
+    "$pre$head`n$($full -join "`n")",
+    "$pre$head`n$($short -join "`n")",
+    "$pre$($short -join "`n")",
+    "$preB$($short -join "`n")",
+    "$preB$one"
+  )
 }
 
 function Show-Error([string]$msg) {
@@ -461,8 +493,8 @@ function Update-Bar {
   if ($wait -gt 0) {
     $note = "rate-limited - retrying in $(Get-WaitText $wait)"
     if ($fb) {
-      $age = [int][math]::Round((Get-Age $fb.ts) / 1000)
-      $shown = if ((Get-Age $fb.ts) -lt $QuietStaleMs) { $null } else { "$note (cached ${age}s ago)" }
+      $age = Get-AgeText (Get-Age $fb.ts)
+      $shown = if ((Get-Age $fb.ts) -lt $QuietStaleMs) { $null } else { "$note (cached $age ago)" }
       Render $fb.S $fb.W $fb.XL $fb.sub $shown
     } else { Show-Error $note }
     return
@@ -515,12 +547,12 @@ function Update-Bar {
     }
 
     if ($fb) {
-      $age = [int][math]::Round((Get-Age $fb.ts) / 1000)
-      $note = if ($coolNote) { "$coolNote (cached ${age}s ago)" }
-              elseif (-not $auth) { "not signed in on this PC - cached ${age}s ago" }
-              elseif ($code -eq 401 -or $code -eq 403) { "$(Get-AuthHint $auth) - cached ${age}s ago" }
-              elseif ($code) { "API $code - cached ${age}s ago" }
-              else { "offline - cached ${age}s ago" }
+      $age = Get-AgeText (Get-Age $fb.ts)
+      $note = if ($coolNote) { "$coolNote (cached $age ago)" }
+              elseif (-not $auth) { "not signed in on this PC - cached $age ago" }
+              elseif ($code -eq 401 -or $code -eq 403) { "$(Get-AuthHint $auth) - cached $age ago" }
+              elseif ($code) { "API $code - cached $age ago" }
+              else { "offline - cached $age ago" }
       if ((Get-Age $fb.ts) -lt $QuietStaleMs) { $note = $null }
       Render $fb.S $fb.W $fb.XL $fb.sub $note
     }
