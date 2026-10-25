@@ -32,7 +32,7 @@ import os from 'node:os';
 import path from 'node:path';
 process.stdout.on('error', () => process.exit(0));
 const line = (s) => process.stdout.write(s + '\n');
-// Menu bar style: `compact` (one ring + its %, the default — it fits a MacBook Air's
+// Menu bar style: `compact` (two rings + the session %, the default — it fits a MacBook Air's
 // menu bar), `icon` (the ring alone) or `full` (the original three bars + numbers). Picked from the dropdown, kept in
 // ~/.config/claude-usage-bar/mac-style; TOKENBAR_MAC_STYLE overrides it.
 // Unfilled track: light on a dark menu bar, dark on a light one, so it never vanishes.
@@ -193,24 +193,28 @@ function barsPNG(segs){
   const out=Buffer.alloc(W0*H0*4),n=SS*SS;
   for(let y=0;y<H0;y++)for(let x=0;x<W0;x++){let r=0,g=0,b=0,a=0;for(let dy=0;dy<SS;dy++)for(let dx=0;dx<SS;dx++){const i=((y*SS+dy)*W+(x*SS+dx))*4;r+=img[i];g+=img[i+1];b+=img[i+2];a+=img[i+3];}const o=(y*W0+x)*4;out[o]=Math.round(r/n);out[o+1]=Math.round(g/n);out[o+2]=Math.round(b/n);out[o+3]=Math.round(a/n);}
   return png(W0,H0,out).toString('base64');}
-// One ring for `icon` / `compact`, drawn as on the design canvas: 16pt (32 px @2x),
-// radius 11.5 and a 3.5 stroke on a 32 grid, filled clockwise from 12 o'clock with
-// round caps, supersampled then box-downscaled. `dim` fades the fill while the
-// numbers are stale, so the icon alone still hints it.
-function ringPNG(pct, col, dim){
-  const S0=32,SS=4,W=S0*SS,img=Buffer.alloc(W*W*4,0);
-  const c=W/2, R=11.5*SS, half=1.75*SS, frac=Math.max(0,Math.min(100,pct))/100;
-  const fa=dim?102:255, end=frac*2*Math.PI;
-  const cap=(a)=>[c+R*Math.sin(a), c-R*Math.cos(a)];
-  const [ax,ay]=cap(0), [bx,by]=cap(end);
-  for(let y=0;y<W;y++)for(let x=0;x<W;x++){
-    const px=x+0.5, py=y+0.5, dx=px-c, dy=py-c, d=Math.hypot(dx,dy);
-    const at=(Math.atan2(dx,-dy)+2*Math.PI)%(2*Math.PI);
-    const onBand=Math.abs(d-R)<=half;
-    const inArc=frac>0 && ((onBand && at<=end) || Math.hypot(px-ax,py-ay)<=half || Math.hypot(px-bx,py-by)<=half || frac>=1&&onBand);
-    const i=(y*W+x)*4;
-    if(inArc){img[i]=col[0];img[i+1]=col[1];img[i+2]=col[2];img[i+3]=fa;}
-    else if(onBand){img[i]=TRACK[0];img[i+1]=TRACK[1];img[i+2]=TRACK[2];img[i+3]=TRACK[3];}
+// The menu bar icon for `icon` / `compact`: two concentric rings on a 32 px grid
+// (16pt @2x), each filled clockwise from 12 o'clock with round caps, supersampled then
+// box-downscaled. Outer ring = the 5-hour session, inner ring = the weekly limit — so
+// a filling session window shows even while a high weekly number sits still. `dim`
+// fades the fills while the numbers are stale, so the icon alone still hints it.
+// `rings` is [{pct, col, R, half}] in 32-grid units.
+function ringsPNG(rings, dim){
+  const S0=32,SS=4,W=S0*SS,img=Buffer.alloc(W*W*4,0),c=W/2,fa=dim?102:255;
+  for (const g of rings) {
+    const R=g.R*SS, half=g.half*SS, frac=Math.max(0,Math.min(100,g.pct))/100, end=frac*2*Math.PI;
+    const cap=(a)=>[c+R*Math.sin(a), c-R*Math.cos(a)];
+    const [ax,ay]=cap(0), [bx,by]=cap(end);
+    for(let y=0;y<W;y++)for(let x=0;x<W;x++){
+      const px=x+0.5, py=y+0.5, dx=px-c, dy=py-c, d=Math.hypot(dx,dy);
+      const onBand=Math.abs(d-R)<=half;
+      const nearCap=frac>0 && (Math.hypot(px-ax,py-ay)<=half || Math.hypot(px-bx,py-by)<=half);
+      if(!onBand && !nearCap) continue;
+      const at=(Math.atan2(dx,-dy)+2*Math.PI)%(2*Math.PI);
+      const inArc=frac>0 && (nearCap || frac>=1 || at<=end);
+      const i=(y*W+x)*4, cl=inArc?[...g.col,fa]:TRACK;
+      img[i]=cl[0];img[i+1]=cl[1];img[i+2]=cl[2];img[i+3]=cl[3];
+    }
   }
   return downscale(img,W,S0,SS);}
 // A thin bar for each row of the dropdown: 44x4pt, rounded, same track.
@@ -252,10 +256,14 @@ function render(S, W, XL, note){
   const summary = `${sp}% ${cd(S?.resets_at)}  ·  W ${wp}%${X?`  ·  ${tag} ${xp}%`:''}`;
   if (STYLE === 'full') line(`${summary} | image=${barsPNG(segs)}`);
   else {
-    // The ring tracks whichever limit is closest to cutting you off.
-    const b = [{p:sp, sev:S?.severity}, {p:wp, sev:W?.severity}, ...(X ? [{p:xp, sev:X.severity}] : [])]
-      .reduce((m, c) => (c.p > m.p ? c : m));
-    line(`${STYLE === 'compact' ? b.p + '%' : ''} | image=${ringPNG(b.p, rgb(b.p, b.sev), !!note)} tooltip="${summary}"`);
+    // Outer ring and the number: the 5-hour session, the one that moves minute to
+    // minute. Inner ring: the tighter of the weekly limits (all-model or per-model).
+    const wk = [{p:wp, sev:W?.severity}, ...(X ? [{p:xp, sev:X.severity}] : [])].reduce((m, c) => (c.p > m.p ? c : m));
+    const icon = ringsPNG([
+      {pct: sp, col: rgb(sp, S?.severity), R: 12.25, half: 1.6},
+      {pct: wk.p, col: rgb(wk.p, wk.sev), R: 7.1, half: 1.6},
+    ], !!note);
+    line(`${STYLE === 'compact' ? sp + '%' : ''} | image=${icon} tooltip="${summary}"`);
   }
   line('---');
   const pl = sub || cache?.sub;   // no creds on this Mac: the plan the cached reading carries

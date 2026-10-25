@@ -173,10 +173,12 @@ and refreshes. Prereqs: `brew install node`, `brew install --cask swiftbar`, and
 signed in to Claude Code once (token read from the macOS Keychain item
 `Claude Code-credentials`).
 
-The menu bar shows one ring and its percentage, about 46 pt wide, so it fits a
-MacBook Air. The ring tracks whichever limit is closest to cutting you off, coloured
-green (under 70%), orange (70–89%) or red (90% and up), and fades while the numbers
-are stale. Click it for every limit, each with its own bar and reset time. The
+The menu bar shows two concentric rings and a percentage, about 46 pt wide, so it fits
+a MacBook Air. The outer ring and the number are the 5-hour session, the limit that
+moves minute to minute. The inner ring is the tighter of the weekly limits (all-model or
+per-model), so a filling session window shows even while a high weekly number sits
+still. Each ring is green (under 70%), orange (70–89%) or red (90% and up), and both
+fade while the numbers are stale. Click it for every limit, each with its own bar and reset time. The
 dropdown's **Menu bar style** submenu switches between *Icon + %* (the default),
 *Icon only* (18 pt) and *Full bars* (the original three bars and numbers). The choice
 is kept in `~/.config/claude-usage-bar/mac-style`, and `TOKENBAR_MAC_STYLE` overrides it.
