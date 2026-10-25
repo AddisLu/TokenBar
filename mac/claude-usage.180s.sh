@@ -11,6 +11,14 @@
 # <bitbar.title>Claude Usage</bitbar.title>
 # <bitbar.desc>Real Claude session + weekly usage and reset (Max/Pro)</bitbar.desc>
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# "Menu bar style" items in the dropdown call the plugin with --style <name>; just
+# remember the choice (SwiftBar re-runs the plugin right after, refresh=true).
+if [ "$1" = "--style" ]; then
+  case "$2" in icon|compact|full)
+    mkdir -p "$HOME/.config/claude-usage-bar" && printf '%s\n' "$2" > "$HOME/.config/claude-usage-bar/mac-style" ;;
+  esac
+  exit 0
+fi
 NODE="$(command -v node)"
 [ -x "$NODE" ] || { echo "◉ node?"; echo "---"; echo "node not found"; exit 0; }
 
@@ -24,7 +32,23 @@ import os from 'node:os';
 import path from 'node:path';
 process.stdout.on('error', () => process.exit(0));
 const line = (s) => process.stdout.write(s + '\n');
-const bad = (m) => { line('○ Claude'); line('---'); line(m); process.exit(0); };
+// Menu bar style: `full` (three bars + numbers), `compact` (one ring + its %), or `icon`
+// (the ring alone) for a crowded menu bar. Picked from the dropdown, kept in
+// ~/.config/claude-usage-bar/mac-style; TOKENBAR_MAC_STYLE overrides it.
+const STYLE_FILE = path.join(os.homedir(), '.config', 'claude-usage-bar', 'mac-style');
+const STYLE = (() => {
+  let v = (process.env.TOKENBAR_MAC_STYLE || '').trim();
+  if (!v) { try { v = fs.readFileSync(STYLE_FILE, 'utf8').trim(); } catch {} }
+  return ['icon', 'compact', 'full'].includes(v) ? v : 'full';
+})();
+const bad = (m) => { line(STYLE === 'full' ? '○ Claude' : '○'); line('---'); line(m); styleMenu(); process.exit(0); };
+// Dropdown submenu that switches the style; SwiftBar passes the plugin's own path.
+function styleMenu(){
+  const me = process.env.SWIFTBAR_PLUGIN_PATH; if (!me) return;
+  line('Menu bar style');
+  for (const [v, label] of [['icon', 'Icon only'], ['compact', 'Icon + %'], ['full', 'Full bars']])
+    line(`--${label} | bash="${me}" param1=--style param2=${v} terminal=false refresh=true${STYLE === v ? ' checked=true' : ''}`);
+}
 
 const CACHE = path.join(os.homedir(), '.cache', 'claude-usage-bar.json');
 const readCache = () => { try { return JSON.parse(fs.readFileSync(CACHE, 'utf8')); } catch { return null; } };
@@ -167,6 +191,23 @@ function barsPNG(segs){
   const out=Buffer.alloc(W0*H0*4),n=SS*SS;
   for(let y=0;y<H0;y++)for(let x=0;x<W0;x++){let r=0,g=0,b=0,a=0;for(let dy=0;dy<SS;dy++)for(let dx=0;dx<SS;dx++){const i=((y*SS+dy)*W+(x*SS+dx))*4;r+=img[i];g+=img[i+1];b+=img[i+2];a+=img[i+3];}const o=(y*W0+x)*4;out[o]=Math.round(r/n);out[o+1]=Math.round(g/n);out[o+2]=Math.round(b/n);out[o+3]=Math.round(a/n);}
   return png(W0,H0,out).toString('base64');}
+// One ring for `icon` / `compact`: filled clockwise from the top to `pct`, drawn the
+// same way (supersampled, box-downscaled) at 36x36 px, i.e. 18pt on Retina.
+// `dim` fades the fill while the numbers are stale, so the icon alone still hints it.
+function ringPNG(pct, col, dim){
+  const S0=36,SS=4,W=S0*SS,img=Buffer.alloc(W*W*4,0);
+  const c=W/2, ro=W/2-3*SS, ri=ro-6*SS, frac=Math.max(0,Math.min(100,pct))/100;
+  for(let y=0;y<W;y++)for(let x=0;x<W;x++){
+    const dx=x+0.5-c, dy=y+0.5-c, d=Math.hypot(dx,dy);
+    if(d<ri||d>ro)continue;
+    const at=((Math.atan2(dx,-dy)/(2*Math.PI))+1)%1;   // 0 at 12 o'clock, clockwise
+    const i=(y*W+x)*4;
+    if(at<frac){img[i]=col[0];img[i+1]=col[1];img[i+2]=col[2];img[i+3]=dim?120:255;}
+    else{img[i]=255;img[i+1]=255;img[i+2]=255;img[i+3]=46;}
+  }
+  const out=Buffer.alloc(S0*S0*4),n=SS*SS;
+  for(let y=0;y<S0;y++)for(let x=0;x<S0;x++){let r=0,g=0,b=0,a=0;for(let dy=0;dy<SS;dy++)for(let dx=0;dx<SS;dx++){const i=((y*SS+dy)*W+(x*SS+dx))*4;r+=img[i]*img[i+3];g+=img[i+1]*img[i+3];b+=img[i+2]*img[i+3];a+=img[i+3];}const o=(y*S0+x)*4;out[o]=a?Math.round(r/a):0;out[o+1]=a?Math.round(g/a):0;out[o+2]=a?Math.round(b/a):0;out[o+3]=Math.round(a/n);}
+  return png(S0,S0,out).toString('base64');}
 const GREEN=[46,194,126],ORANGE=[255,120,0],RED=[224,27,36];
 const rgb=(p,sev)=>(sev==='critical'||p>=90)?RED:(sev==='warning'||p>=70)?ORANGE:GREEN;
 const cd=(iso)=>{if(!iso)return 'n/a';let ms=new Date(iso)-Date.now();if(ms<=0)return 'now';const m=Math.floor(ms/60000),h=Math.floor(m/60);return h>0?`${h}:${String(m%60).padStart(2,'0')}`:`${m}m`;};
@@ -186,7 +227,14 @@ function render(S, W, XL, note){
     ? [{pct:sp,col:rgb(sp,S?.severity),w:50},{pct:wp,col:rgb(wp,W?.severity),w:40},{pct:xp,col:rgb(xp,X.severity),w:40}]
     : [{pct:sp,col:rgb(sp,S?.severity),w:56},{pct:wp,col:rgb(wp,W?.severity),w:48}];
   const tag=X?((X.name||'S')[0]||'S').toUpperCase():'';
-  line(`${sp}% ${cd(S?.resets_at)}  ·  W ${wp}%${X?`  ·  ${tag} ${xp}%`:''} | image=${barsPNG(segs)}`);
+  const summary = `${sp}% ${cd(S?.resets_at)}  ·  W ${wp}%${X?`  ·  ${tag} ${xp}%`:''}`;
+  if (STYLE === 'full') line(`${summary} | image=${barsPNG(segs)}`);
+  else {
+    // The ring tracks whichever limit is closest to cutting you off.
+    const b = [{p:sp, sev:S?.severity}, {p:wp, sev:W?.severity}, ...(X ? [{p:xp, sev:X.severity}] : [])]
+      .reduce((m, c) => (c.p > m.p ? c : m));
+    line(`${STYLE === 'compact' ? b.p + '%' : ''} | image=${ringPNG(b.p, rgb(b.p, b.sev), !!note)} tooltip="${summary}"`);
+  }
   line('---');
   line(`Claude${sub?' — '+sub:''}`);
   if (note) line(`${note} | color=orange`);
@@ -196,6 +244,7 @@ function render(S, W, XL, note){
     line(`Weekly · ${l.name}: ${Math.round(l.percent??0)}%   resets ${clock(l.resets_at)} (in ${cd(l.resets_at)})`);
   line('---');
   line('Refresh | refresh=true');
+  styleMenu();
   process.exit(0);
 }
 // The plugin draws from cache whenever the API is throttled, offline or in a 429
