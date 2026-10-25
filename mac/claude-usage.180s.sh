@@ -11,6 +11,14 @@
 # <bitbar.title>Claude Usage</bitbar.title>
 # <bitbar.desc>Real Claude session + weekly usage and reset (Max/Pro)</bitbar.desc>
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# "Menu bar style" items in the dropdown call the plugin with --style <name>; just
+# remember the choice (SwiftBar re-runs the plugin right after, refresh=true).
+if [ "$1" = "--style" ]; then
+  case "$2" in icon|compact|full)
+    mkdir -p "$HOME/.config/claude-usage-bar" && printf '%s\n' "$2" > "$HOME/.config/claude-usage-bar/mac-style" ;;
+  esac
+  exit 0
+fi
 NODE="$(command -v node)"
 [ -x "$NODE" ] || { echo "◉ node?"; echo "---"; echo "node not found"; exit 0; }
 
@@ -24,7 +32,25 @@ import os from 'node:os';
 import path from 'node:path';
 process.stdout.on('error', () => process.exit(0));
 const line = (s) => process.stdout.write(s + '\n');
-const bad = (m) => { line('○ Claude'); line('---'); line(m); process.exit(0); };
+// Menu bar style: `compact` (one ring + its %, the default — it fits a MacBook Air's
+// menu bar), `icon` (the ring alone) or `full` (the original three bars + numbers). Picked from the dropdown, kept in
+// ~/.config/claude-usage-bar/mac-style; TOKENBAR_MAC_STYLE overrides it.
+// Unfilled track: light on a dark menu bar, dark on a light one, so it never vanishes.
+const TRACK = process.env.OS_APPEARANCE === 'Light' ? [0,0,0,41] : [255,255,255,71];
+const STYLE_FILE = path.join(os.homedir(), '.config', 'claude-usage-bar', 'mac-style');
+const STYLE = (() => {
+  let v = (process.env.TOKENBAR_MAC_STYLE || '').trim();
+  if (!v) { try { v = fs.readFileSync(STYLE_FILE, 'utf8').trim(); } catch {} }
+  return ['icon', 'compact', 'full'].includes(v) ? v : 'compact';
+})();
+const bad = (m) => { line(STYLE === 'full' ? '○ Claude' : '○ ––'); line('---'); line(m); styleMenu(); process.exit(0); };
+// Dropdown submenu that switches the style; SwiftBar passes the plugin's own path.
+function styleMenu(){
+  const me = process.env.SWIFTBAR_PLUGIN_PATH; if (!me) return;
+  line('Menu bar style');
+  for (const [v, label] of [['icon', 'Icon only'], ['compact', 'Icon + %'], ['full', 'Full bars']])
+    line(`--${label} | bash="${me}" param1=--style param2=${v} terminal=false refresh=true${STYLE === v ? ' checked=true' : ''}`);
+}
 
 const CACHE = path.join(os.homedir(), '.cache', 'claude-usage-bar.json');
 const readCache = () => { try { return JSON.parse(fs.readFileSync(CACHE, 'utf8')); } catch { return null; } };
@@ -159,7 +185,7 @@ function barsPNG(segs){
   const bh=13,by=(H0-bh)/2,rad=bh/2;
   let x=m;
   for(const s of segs){
-    rr(x,by,s.w,bh,rad,255,255,255,46);
+    rr(x,by,s.w,bh,rad,...TRACK);
     rr(x,by,Math.max(bh,Math.round(s.w*Math.min(100,s.pct)/100)),bh,rad,...s.col,255);
     x+=s.w+gap;
   }
@@ -167,7 +193,44 @@ function barsPNG(segs){
   const out=Buffer.alloc(W0*H0*4),n=SS*SS;
   for(let y=0;y<H0;y++)for(let x=0;x<W0;x++){let r=0,g=0,b=0,a=0;for(let dy=0;dy<SS;dy++)for(let dx=0;dx<SS;dx++){const i=((y*SS+dy)*W+(x*SS+dx))*4;r+=img[i];g+=img[i+1];b+=img[i+2];a+=img[i+3];}const o=(y*W0+x)*4;out[o]=Math.round(r/n);out[o+1]=Math.round(g/n);out[o+2]=Math.round(b/n);out[o+3]=Math.round(a/n);}
   return png(W0,H0,out).toString('base64');}
-const GREEN=[46,194,126],ORANGE=[255,120,0],RED=[224,27,36];
+// One ring for `icon` / `compact`, drawn as on the design canvas: 16pt (32 px @2x),
+// radius 11.5 and a 3.5 stroke on a 32 grid, filled clockwise from 12 o'clock with
+// round caps, supersampled then box-downscaled. `dim` fades the fill while the
+// numbers are stale, so the icon alone still hints it.
+function ringPNG(pct, col, dim){
+  const S0=32,SS=4,W=S0*SS,img=Buffer.alloc(W*W*4,0);
+  const c=W/2, R=11.5*SS, half=1.75*SS, frac=Math.max(0,Math.min(100,pct))/100;
+  const fa=dim?102:255, end=frac*2*Math.PI;
+  const cap=(a)=>[c+R*Math.sin(a), c-R*Math.cos(a)];
+  const [ax,ay]=cap(0), [bx,by]=cap(end);
+  for(let y=0;y<W;y++)for(let x=0;x<W;x++){
+    const px=x+0.5, py=y+0.5, dx=px-c, dy=py-c, d=Math.hypot(dx,dy);
+    const at=(Math.atan2(dx,-dy)+2*Math.PI)%(2*Math.PI);
+    const onBand=Math.abs(d-R)<=half;
+    const inArc=frac>0 && ((onBand && at<=end) || Math.hypot(px-ax,py-ay)<=half || Math.hypot(px-bx,py-by)<=half || frac>=1&&onBand);
+    const i=(y*W+x)*4;
+    if(inArc){img[i]=col[0];img[i+1]=col[1];img[i+2]=col[2];img[i+3]=fa;}
+    else if(onBand){img[i]=TRACK[0];img[i+1]=TRACK[1];img[i+2]=TRACK[2];img[i+3]=TRACK[3];}
+  }
+  return downscale(img,W,S0,SS);}
+// A thin bar for each row of the dropdown: 44x4pt, rounded, same track.
+function miniBarPNG(pct, col){
+  const W0=88,H0=8,SS=4,W=W0*SS,H=H0*SS,img=Buffer.alloc(W*H*4,0),r=H/2;
+  const fill=Math.max(H, Math.round(W*Math.max(0,Math.min(100,pct))/100));
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const cx=Math.min(x+0.5,W-x-0.5), dy=Math.abs(y+0.5-r);
+    if(cx<r && Math.hypot(r-cx,dy)>r) continue;
+    const fx=Math.min(x+0.5,fill-x-0.5), inFill=x<fill && !(fx<r && Math.hypot(r-fx,dy)>r);
+    const i=(y*W+x)*4, cl=inFill?[...col,255]:TRACK;
+    img[i]=cl[0];img[i+1]=cl[1];img[i+2]=cl[2];img[i+3]=cl[3];
+  }
+  return downscale(img,W,W0,SS,H0);}
+// Alpha-weighted box downscale SS→1 (keeps colour at anti-aliased edges).
+function downscale(img,W,W0,SS,H0=W0){
+  const out=Buffer.alloc(W0*H0*4),n=SS*SS;
+  for(let y=0;y<H0;y++)for(let x=0;x<W0;x++){let r=0,g=0,b=0,a=0;for(let dy=0;dy<SS;dy++)for(let dx=0;dx<SS;dx++){const i=((y*SS+dy)*W+(x*SS+dx))*4,al=img[i+3];r+=img[i]*al;g+=img[i+1]*al;b+=img[i+2]*al;a+=al;}const o=(y*W0+x)*4;out[o]=a?Math.round(r/a):0;out[o+1]=a?Math.round(g/a):0;out[o+2]=a?Math.round(b/a):0;out[o+3]=Math.round(a/n);}
+  return png(W0,H0,out).toString('base64');}
+const GREEN=[52,199,89],ORANGE=[255,149,0],RED=[255,59,48];   // macOS systemGreen / Orange / Red
 const rgb=(p,sev)=>(sev==='critical'||p>=90)?RED:(sev==='warning'||p>=70)?ORANGE:GREEN;
 const cd=(iso)=>{if(!iso)return 'n/a';let ms=new Date(iso)-Date.now();if(ms<=0)return 'now';const m=Math.floor(ms/60000),h=Math.floor(m/60);return h>0?`${h}:${String(m%60).padStart(2,'0')}`:`${m}m`;};
 const clock=(iso)=>iso?new Date(iso).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'}):'n/a';
@@ -186,16 +249,29 @@ function render(S, W, XL, note){
     ? [{pct:sp,col:rgb(sp,S?.severity),w:50},{pct:wp,col:rgb(wp,W?.severity),w:40},{pct:xp,col:rgb(xp,X.severity),w:40}]
     : [{pct:sp,col:rgb(sp,S?.severity),w:56},{pct:wp,col:rgb(wp,W?.severity),w:48}];
   const tag=X?((X.name||'S')[0]||'S').toUpperCase():'';
-  line(`${sp}% ${cd(S?.resets_at)}  ·  W ${wp}%${X?`  ·  ${tag} ${xp}%`:''} | image=${barsPNG(segs)}`);
+  const summary = `${sp}% ${cd(S?.resets_at)}  ·  W ${wp}%${X?`  ·  ${tag} ${xp}%`:''}`;
+  if (STYLE === 'full') line(`${summary} | image=${barsPNG(segs)}`);
+  else {
+    // The ring tracks whichever limit is closest to cutting you off.
+    const b = [{p:sp, sev:S?.severity}, {p:wp, sev:W?.severity}, ...(X ? [{p:xp, sev:X.severity}] : [])]
+      .reduce((m, c) => (c.p > m.p ? c : m));
+    line(`${STYLE === 'compact' ? b.p + '%' : ''} | image=${ringPNG(b.p, rgb(b.p, b.sev), !!note)} tooltip="${summary}"`);
+  }
   line('---');
-  line(`Claude${sub?' — '+sub:''}`);
+  const pl = sub || cache?.sub;   // no creds on this Mac: the plan the cached reading carries
+  const plan = pl ? pl[0].toUpperCase() + pl.slice(1) : '';
+  line(`Claude${plan ? ' · ' + plan : ''} | size=12 color=#8E8E93`);
   if (note) line(`${note} | color=orange`);
-  line(`Session (5h): ${sp}%   resets ${clock(S?.resets_at)} (in ${cd(S?.resets_at)})`);
-  line(`Weekly: ${wp}%   resets ${clock(W?.resets_at)} (in ${cd(W?.resets_at)})`);
-  for (const l of scoped)
-    line(`Weekly · ${l.name}: ${Math.round(l.percent??0)}%   resets ${clock(l.resets_at)} (in ${cd(l.resets_at)})`);
+  const row = (name, p, sev, at) => {
+    line(`${name}   ${p}% | image=${miniBarPNG(p, rgb(p, sev))}`);
+    line(`Resets ${clock(at)} · in ${cd(at)} | size=11 color=#8E8E93`);
+  };
+  row('Session · 5h', sp, S?.severity, S?.resets_at);
+  row('Weekly', wp, W?.severity, W?.resets_at);
+  for (const l of scoped) row(`Weekly · ${l.name}`, Math.round(l.percent??0), l.severity, l.resets_at);
   line('---');
   line('Refresh | refresh=true');
+  styleMenu();
   process.exit(0);
 }
 // The plugin draws from cache whenever the API is throttled, offline or in a 429
