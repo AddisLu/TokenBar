@@ -3,8 +3,8 @@
 #
 # Raspberry Pi OS draws its panel with wf-panel-pi, not GNOME Shell, so the
 # extension in linux/ can't load there. wf-panel-pi does host StatusNotifierItem
-# icons in its tray, so this registers one: the icon (session % over a session bar
-# and a weekly bar) is drawn on the fly and the menu mirrors the GNOME dropdown.
+# icons in its tray, so this registers one: the icon (the tightest limit's % over
+# up to two limit bars) is drawn on the fly and the menu mirrors the GNOME dropdown.
 # Data comes from the same usage-fetch.mjs the GNOME extension runs, so the cache,
 # the 429 cooldown and the shared cache behave identically.
 #
@@ -424,10 +424,16 @@ class Tray:
 
         limits = d.get('limits') or []
         s = d.get('session')
+        # A pre-update fetcher (or a stale cache it wrote) passed another limit off
+        # as the session; trust only the real kind. Current plans have no session
+        # (5h) limit at all, so s is normally None.
+        if s and s.get('kind') != 'session':
+            s = None
         w = next((l for l in limits if l.get('kind') == 'weekly_all'), None)
-        # Per-model weekly caps (Fable today). The icon has room for one weekly
-        # bar, so it shows whichever weekly limit will cut you off first.
-        scoped = sorted((l for l in limits if l.get('kind') == 'weekly_scoped'),
+        # Per-model weekly caps (Fable today) and budget-style limits. The icon has
+        # room for one bar besides the weekly, so it shows whichever of these will
+        # cut you off first; the menu lists them all.
+        others = sorted((l for l in limits if l.get('kind') in ('weekly_scoped', 'extra')),
                         key=lambda l: l.get('percent') or 0, reverse=True)
 
         sub = d.get('subscription')
@@ -437,22 +443,23 @@ class Tray:
             bars.append((s['percent'], color_for(s['percent'], s.get('severity'))))
             rel = fmt_countdown(ms_until(s.get('resetsAt')))
             tip.append(f"{s['percent']}%{' · ' + rel if rel else ''}")
-            lines.append(f"Session (5h): {s['percent']}%   resets {fmt_reset(s.get('resetsAt'))}")
+            worst = max([x for x in [w] + others[:1] if x],
+                        key=lambda l: l.get('percent') or 0, default=None)
+            if worst:
+                bars.append((worst['percent'], color_for(worst['percent'], worst.get('severity'))))
         else:
-            lines.append('Session: n/a')
-
-        worst = max([x for x in [w] + scoped[:1] if x], key=lambda l: l.get('percent') or 0, default=None)
-        if worst:
-            bars.append((worst['percent'], color_for(worst['percent'], worst.get('severity'))))
+            # no session limit on this plan: weekly bar + the tightest other limit
+            for l in [w] + others[:1]:
+                if l:
+                    bars.append((l['percent'], color_for(l['percent'], l.get('severity'))))
         if w:
             tip.append(f"W {w['percent']}%")
-            lines.append(f"Weekly: {w['percent']}%   resets {fmt_reset(w.get('resetsAt'))}")
-        else:
-            lines.append('Weekly: n/a')
-        if scoped:
-            x = scoped[0]
-            tip.append(f"{(x.get('scopeName') or 'S')[0].upper()} {x['percent']}%")
-        lines += [f"{l['label']}: {l['percent']}%   resets {fmt_reset(l.get('resetsAt'))}" for l in scoped]
+        if others:
+            x = others[0]
+            tip.append(f"{(x.get('scopeName') or 'X')[0].upper()} {x['percent']}%")
+        # one menu line per limit, whatever kinds the plan has today
+        lines += [f"{l['label']}: {l['percent']}%   resets {fmt_reset(l.get('resetsAt'))}"
+                  for l in limits]
 
         if d.get('stale') and (d.get('cacheAgeSec') or 0) > QUIET_STALE_SEC:
             # A 429 is a cooldown, not a dead end: say when we'll try again, so it's
@@ -471,7 +478,10 @@ class Tray:
             lines.append(f"Updated {fmt_clock(d.get('fetchedAt'))}")
 
         summary = '  ·  '.join(tip)
-        self._publish(f"{s['percent']}" if s else '–', bars or [(0, GREY)], True,
+        # the icon's number: the session when the plan has one, else the limit that
+        # will cut you off first — the number the whole icon exists to show
+        prime = s or max(limits, key=lambda l: l.get('percent') or 0, default=None)
+        self._publish(f"{prime['percent']}" if prime else '–', bars or [(0, GREY)], True,
                       summary, f'Claude  {summary}', lines)
 
     # ---------------- fetching ----------------

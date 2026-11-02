@@ -138,10 +138,11 @@ function payloadFromXTool(xt, takenAt) {
         mk(r.session, 'session', 'session'),
         mk(r.weekly, 'weekly_all', 'weekly'),
         ...(r.scoped || []).map(l => mk(l, 'weekly_scoped', 'weekly', l.name)),
+        ...(r.extras || []).map(extraToLimit),
     ].filter(Boolean);
     return {
         ok: true, fetchedAt: new Date(takenAt).toISOString(), subscription: sub || r.subscription || null,
-        session: limits.find(l => l.kind === 'session') || limits[0] || null,
+        session: limits.find(l => l.kind === 'session') || null,
         limits, credits: null, fromSharedCache: true, sharedAgeSec: ageSec(takenAt),
     };
 }
@@ -159,6 +160,9 @@ function xtoolReading(limits, now) {
         weekly: norm(limits.find(l => l.kind === 'weekly_all')),
         scoped: limits.filter(l => l.kind === 'weekly_scoped')
             .map(l => ({...norm(l), name: l.scopeName || 'scoped'}))
+            .sort((a, b) => b.percent - a.percent),
+        extras: limits.filter(l => l.kind === 'extra')
+            .map(l => ({...norm(l), name: l.scopeName || 'extra', used: l.used ?? null, limit: l.limit ?? null}))
             .sort((a, b) => b.percent - a.percent),
     };
 }
@@ -179,10 +183,11 @@ function payloadFromShared(sh) {
         mk(sh.S, 'session', 'session'),
         mk(sh.W, 'weekly_all', 'weekly'),
         ...(sh.XL || []).map(l => mk(l, 'weekly_scoped', 'weekly')),
+        ...(sh.E || []).map(extraToLimit),
     ].filter(Boolean);
     return {
         ok: true, fetchedAt: new Date(sh.ts).toISOString(), subscription: sh.sub ?? null,
-        session: limits.find(l => l.kind === 'session') || limits[0] || null,
+        session: limits.find(l => l.kind === 'session') || null,
         limits, credits: null, fromSharedCache: true, sharedAgeSec: ageSec(sh.ts),
     };
 }
@@ -223,7 +228,40 @@ function label(l) {
         default: return l.kind;
     }
 }
-const RANK = {session: 0, daily: 1, weekly_all: 2, weekly_scoped: 3};
+const RANK = {session: 0, daily: 1, weekly_all: 2, weekly_scoped: 3, extra: 4};
+
+// Newer plans gate usage with budget-style limits (dollar allowances) that arrive as
+// extra top-level objects under rotating codenamed keys and are NOT in limits[] —
+// often the only limit with real utilization while every limits[] entry sits at 0%.
+// Scan for the shape rather than the name, so a renamed field still shows up.
+const EXTRA_SKIP = /^(five_hour|seven_day|extra_usage|spend|pace|promo)/;
+function extraLimits(d) {
+    const out = [];
+    for (const [k, v] of Object.entries(d)) {
+        if (EXTRA_SKIP.test(k) || !v || typeof v !== 'object') continue;
+        if (typeof v.utilization !== 'number' || !v.resets_at) continue;
+        const dollars = v.limit_dollars != null;
+        out.push({
+            name: dollars ? 'Budget' : k.replace(/_/g, ' '),
+            percent: Math.round(v.utilization),
+            resets_at: v.resets_at,
+            severity: 'normal',
+            used: v.used_dollars ?? null,
+            limit: v.limit_dollars ?? null,
+        });
+    }
+    return out.sort((a, b) => b.percent - a.percent);
+}
+const extraLabel = (e) => e.limit != null
+    ? `${e.name} · $${Math.round(e.used ?? 0)}/$${e.limit}`
+    : e.name;
+// an extras entry (API scan or a shared/xtool copy) → this payload's limit shape
+const extraToLimit = (e) => ({
+    kind: 'extra', group: 'extra', label: extraLabel(e), scopeName: e.name,
+    percent: Math.round(e.percent ?? 0), resetsAt: e.resets_at ?? e.resetsAt ?? null,
+    severity: e.severity ?? 'normal', isActive: false,
+    used: e.used ?? null, limit: e.limit ?? null,
+});
 
 const cache = readCache();
 const sh = await readShared();
@@ -328,10 +366,12 @@ try {
         resetsAt: l.resets_at ?? null,
         severity: l.severity ?? 'normal',
         isActive: !!l.is_active,
-    })).sort((a, b) => (RANK[a.kind] ?? 9) - (RANK[b.kind] ?? 9));
+    })).concat(extraLimits(d).map(extraToLimit))
+        .sort((a, b) => (RANK[a.kind] ?? 9) - (RANK[b.kind] ?? 9));
 
-    // panel bar tracks the session (5h) limit; fall back to the first limit
-    const session = limits.find(l => l.kind === 'session') || limits[0] || null;
+    // the session (5h) limit, when the plan still has one — current plans don't, so
+    // the panels must not pass another limit off as the session
+    const session = limits.find(l => l.kind === 'session') || null;
 
     // pay-as-you-go extra-usage credits, only if the user enabled them
     let credits = null;
@@ -356,6 +396,7 @@ try {
         S: flat(limits.find(l => l.kind === 'session')),
         W: flat(limits.find(l => l.kind === 'weekly_all')),
         XL: limits.filter(l => l.kind === 'weekly_scoped').map(l => ({...flat(l), name: l.scopeName || 'scoped'})),
+        E: limits.filter(l => l.kind === 'extra').map(l => ({...flat(l), name: l.scopeName || 'extra', used: l.used, limit: l.limit})),
     });
     // ...and for the tools on this machine, so Loop's engine reuses this fetch instead of
     // making its own. blockedUntil omitted: the budget is evidently back.

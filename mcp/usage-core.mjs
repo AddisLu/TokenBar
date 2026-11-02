@@ -124,7 +124,27 @@ const fromShared = (sh) => ({
     session: norm(sh.S),
     weekly: norm(sh.W),
     scoped: (sh.XL || []).map(l => ({...norm(l), name: l.name})),
+    extras: (sh.E || []).map(l => ({...norm(l), name: l.name, used: l.used ?? null, limit: l.limit ?? null})),
 });
+
+// Budget-style limits (dollar allowances) newer plans use: extra top-level objects
+// under rotating codenamed keys with {utilization, resets_at, limit_dollars…}, NOT in
+// limits[] — often the only limit with real utilization while every limits[] entry
+// sits at 0%. Match the shape, not the name, so a renamed field still shows up.
+const EXTRA_SKIP = /^(five_hour|seven_day|extra_usage|spend|pace|promo)/;
+function extraLimits(d) {
+    const out = [];
+    for (const [k, v] of Object.entries(d)) {
+        if (EXTRA_SKIP.test(k) || !v || typeof v !== 'object') continue;
+        if (typeof v.utilization !== 'number' || !v.resets_at) continue;
+        out.push({
+            name: v.limit_dollars != null ? 'Budget' : k.replace(/_/g, ' '),
+            percent: Math.round(v.utilization), resets_at: v.resets_at, severity: 'normal',
+            used: v.used_dollars ?? null, limit: v.limit_dollars ?? null,
+        });
+    }
+    return out.sort((a, b) => b.percent - a.percent);
+}
 
 function readCredsJson() {
     try { return JSON.parse(fs.readFileSync(CRED, 'utf8')).claudeAiOauth; } catch {}
@@ -219,6 +239,8 @@ export async function fetchUsage() {
 
     const d = await res.json();
     const lim = Array.isArray(d.limits) ? d.limits : [];
+    // Current plans have no session (5h) limit; session stays null then rather than
+    // another limit passing for it.
     const session = norm(lim.find(l => l.kind === 'session'), d.five_hour);
     const weekly = norm(lim.find(l => l.kind === 'weekly_all'), d.seven_day);
     // Per-model weekly caps (Fable today, Opus before it). These are frequently the
@@ -227,6 +249,8 @@ export async function fetchUsage() {
     const scoped = lim.filter(l => l.kind === 'weekly_scoped')
         .map(l => ({...norm(l), name: l.scope?.model?.display_name || l.scope?.surface || 'scoped'}))
         .sort((a, b) => b.percent - a.percent);
+    const extrasRaw = extraLimits(d);
+    const extras = extrasRaw.map(l => ({...norm(l), name: l.name, used: l.used, limit: l.limit}));
 
     // Publish for the other machines/apps sharing this account's request budget.
     // Omitting blockedUntil clears any cooldown: the budget is evidently back.
@@ -238,9 +262,10 @@ export async function fetchUsage() {
         W: toShared(lim.find(l => l.kind === 'weekly_all'), d.seven_day),
         XL: lim.filter(l => l.kind === 'weekly_scoped')
             .map(l => ({...toShared(l), name: l.scope?.model?.display_name || l.scope?.surface || 'scoped'})),
+        E: extrasRaw,
     });
 
-    const reading = {ok: true, subscription: sub || null, fetchedAt: new Date(now).toISOString(), session, weekly, scoped};
+    const reading = {ok: true, subscription: sub || null, fetchedAt: new Date(now).toISOString(), session, weekly, scoped, extras};
     writeXTool({reading, ts: now});   // blockedUntil dropped: the budget is evidently back
     return reading;
 }
@@ -253,9 +278,12 @@ export function humanSummary(u) {
         return `${name}: ${l.percent}% used, resets in ${h}`;
     };
     return [`Claude${u.subscription ? ` (${u.subscription})` : ''} usage:`,
-            '• ' + fmt(u.session, 'Session (5h)'),
+            // current plans have no session (5h) limit; skip the line instead of "n/a"
+            ...(u.session ? ['• ' + fmt(u.session, 'Session (5h)')] : []),
             '• ' + fmt(u.weekly, 'Weekly'),
             ...(u.scoped || []).map(l => '• ' + fmt(l, `Weekly · ${l.name}`)),
+            ...(u.extras || []).map(l => '• ' + fmt(l,
+                l.limit != null ? `${l.name} ($${Math.round(l.used ?? 0)} of $${l.limit})` : l.name)),
             // say so rather than passing off a peer's reading as a live one
             ...(u.fromSharedCache ? [`(shared cache, ${u.cacheAgeSeconds}s old — reused to spare the account-level rate limit)`] : []),
             // say plainly that the numbers are frozen, and for how long
@@ -267,7 +295,8 @@ export function appendHistory(u) {
     if (!u.ok) return false;
     const row = {ts: u.fetchedAt, session: u.session?.percent ?? null, sessionResetsAt: u.session?.resetsAt ?? null,
         weekly: u.weekly?.percent ?? null, weeklyResetsAt: u.weekly?.resetsAt ?? null,
-        scoped: (u.scoped || []).map(l => ({name: l.name, percent: l.percent, resetsAt: l.resetsAt}))};
+        scoped: (u.scoped || []).map(l => ({name: l.name, percent: l.percent, resetsAt: l.resetsAt})),
+        extras: (u.extras || []).map(l => ({name: l.name, percent: l.percent, resetsAt: l.resetsAt, used: l.used ?? null, limit: l.limit ?? null}))};
     try {
         fs.mkdirSync(path.dirname(HISTORY), {recursive: true});
         fs.appendFileSync(HISTORY, JSON.stringify(row) + '\n');

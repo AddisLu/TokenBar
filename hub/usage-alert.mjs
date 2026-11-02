@@ -85,9 +85,12 @@ function evaluate(r, state, now) {
     }
 
     const limits = [
-        ['S', 'Session (5h)', r.S],
+        ['S', 'Session (5h)', r.S],   // null on current plans, which have no session limit
         ['W', 'Weekly', r.W],
         ...(r.XL || []).map(l => [`XL:${l.name}`, `${l.name} weekly`, l]),
+        // budget-style limits (dollar allowances) newer plans use
+        ...(r.E || []).map(l => [`E:${l.name}`,
+            l.limit != null ? `${l.name} ($${l.limit})` : l.name, l]),
     ];
     for (const [key, label, l] of limits) {
         if (!l || l.percent == null) continue;
@@ -113,7 +116,12 @@ async function main() {
 
     if (process.argv.includes('--test')) {
         const r = readJson(SHARED);
-        const s = r?.S ? `Session ${Math.round(r.S.percent)}%, weekly ${Math.round(r.W?.percent)}%` : 'no hub reading yet';
+        const parts = [
+            r?.S ? `session ${Math.round(r.S.percent)}%` : null,
+            r?.W ? `weekly ${Math.round(r.W.percent)}%` : null,
+            ...(r?.E || []).map(l => `${l.name.toLowerCase()} ${Math.round(l.percent)}%`),
+        ].filter(Boolean);
+        const s = parts.length ? parts.join(', ') : 'no hub reading yet';
         await push(url, {title: 'TokenBar alerts are on', tags: ['white_check_mark'],
             message: `You'll be notified at ${THRESHOLDS.join('% and ')}% of each limit. Now: ${s}.`});
         log('test notification sent');

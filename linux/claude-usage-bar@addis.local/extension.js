@@ -117,6 +117,11 @@ class Indicator extends PanelMenu.Button {
         return it;
     }
 
+    _showSession(visible) {
+        this._sBar.track.visible = visible;
+        this._sLabel.visible = visible;
+    }
+
     _showWeekly(visible) {
         this._wLabel0.visible = visible;
         this._wBar.track.visible = visible;
@@ -138,10 +143,12 @@ class Indicator extends PanelMenu.Button {
                 'rate-limited': 'rate-limited', 'http-429': 'rate-limited',
             }[err] || (/^http-\d/.test(err) ? 'API error' : err);
             this._icon.text = '○';
+            this._showSession(true);
             this._sLabel.text = msg;
             setBar(this._sBar, 0, 'rgba(255,255,255,0.3)');
             this._showWeekly(false);
             this._showScoped(false);
+            this._mSession.visible = true;
             this._mSession.label.text = data.error === 'auth-expired'
                 ? `Token expired — ${data.hint || 'run Claude Code once'}`
                 : data.error === 'rate-limited'
@@ -154,26 +161,30 @@ class Indicator extends PanelMenu.Button {
         }
 
         this._icon.text = '◉';
-        const s = data.session;
+        // A pre-update fetcher (or a stale cache it wrote) passed another limit off
+        // as the session; trust only the real kind. Current plans have no session
+        // (5h) limit at all, so the session bar is normally hidden entirely.
+        let s = data.session;
+        if (s && s.kind && s.kind !== 'session') s = null;
         const w = (data.limits || []).find(l => l.kind === 'weekly_all');
-        // Per-model weekly caps (Fable today, Opus before it). The panel has room
-        // for one, so it shows the most-consumed — that's the one that will cut you
-        // off first — while the dropdown lists them all.
+        // Per-model weekly caps (Fable today, Opus before it) and budget-style
+        // limits. The panel has room for one, so it shows the most-consumed —
+        // that's the one that will cut you off first — while the dropdown lists them all.
         const scoped = (data.limits || [])
-            .filter(l => l.kind === 'weekly_scoped')
+            .filter(l => l.kind === 'weekly_scoped' || l.kind === 'extra')
             .sort((a, b) => (b.percent ?? 0) - (a.percent ?? 0));
 
-        // session (panel bar + countdown)
+        // session (panel bar + countdown) — hidden on plans without one
+        this._mSession.visible = !!s;
         if (s) {
+            this._showSession(true);
             const c = colorFor(s.percent, s.severity);
             setBar(this._sBar, s.percent, c);
             const rel = s.resetsAt ? fmtCountdown(new Date(s.resetsAt).getTime() - Date.now()) : '';
             this._sLabel.text = `${s.percent}%${rel ? ' · ' + rel : ''}`;
             this._mSession.label.text = `Session (5h): ${s.percent}%   resets ${s.resetsAt ? fmtReset(s.resetsAt) : 'n/a'}`;
         } else {
-            setBar(this._sBar, 0, '#2ec27e');
-            this._sLabel.text = 'n/a';
-            this._mSession.label.text = 'Session: n/a';
+            this._showSession(false);
         }
 
         // weekly (second panel bar)

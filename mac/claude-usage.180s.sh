@@ -111,14 +111,15 @@ function readXTool(){ try { const o = JSON.parse(fs.readFileSync(XTOOL,'utf8'));
 // When the reading was taken. Older Loop builds re-stamped a cached reading `ts: now`, so
 // take the earlier of ts and its own fetchedAt — a re-dated old reading must not pass for fresh.
 function xtoolTakenAt(xt){ const f = Date.parse(xt.reading?.fetchedAt ?? ''); return Number.isFinite(f) ? Math.min(xt.ts, f) : xt.ts; }
-// usage-core's reading shape (camelCase resetsAt, scoped[] with a name) <-> S/W/XL here
+// usage-core's reading shape (camelCase resetsAt, scoped[] with a name) <-> S/W/XL/E here
 const fromXT = (x) => x && {percent: x.percent, resets_at: x.resetsAt ?? null, severity: x.severity ?? 'normal'};
-function toXT(S, W, XL, now){
+function toXT(S, W, XL, E, now){
   const norm = (x) => x ? {percent: Math.round(x.percent ?? 0), resetsAt: x.resets_at ?? null,
     resetsInMinutes: x.resets_at ? Math.max(0, Math.round((new Date(x.resets_at) - now) / 60000)) : null,
     severity: x.severity ?? 'normal'} : null;
   return {ok: true, subscription: sub || null, fetchedAt: new Date(now).toISOString(), session: norm(S), weekly: norm(W),
-    scoped: (XL || []).map(l => ({...norm(l), name: l.name})).sort((a, b) => b.percent - a.percent)};
+    scoped: (XL || []).map(l => ({...norm(l), name: l.name})).sort((a, b) => b.percent - a.percent),
+    extras: (E || []).map(l => ({...norm(l), name: l.name, used: l.used ?? null, limit: l.limit ?? null})).sort((a, b) => b.percent - a.percent)};
 }
 // Another machine's clock may run ahead of ours; treat "written in the future" as fresh
 // rather than as a wildly stale entry.
@@ -239,31 +240,41 @@ const rgb=(p,sev)=>(sev==='critical'||p>=90)?RED:(sev==='warning'||p>=70)?ORANGE
 const cd=(iso)=>{if(!iso)return 'n/a';let ms=new Date(iso)-Date.now();if(ms<=0)return 'now';const m=Math.floor(ms/60000),h=Math.floor(m/60);return h>0?`${h}:${String(m%60).padStart(2,'0')}`:`${m}m`;};
 const clock=(iso)=>iso?new Date(iso).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'}):'n/a';
 
-// Draw the menu bar + dropdown from S/W/XL. Countdowns are recomputed live, so even
-// a cached S/W shows an accurate reset timer. `note` (optional) is shown dimmed
+// Draw the menu bar + dropdown from S/W/XL/E. Countdowns are recomputed live, so even
+// a cached reading shows an accurate reset timer. `note` (optional) is shown dimmed
 // in the dropdown to explain a stale/fallback state.
-// XL holds the scoped weekly limits (per-model caps such as Fable). The menu bar
-// has room for one, so it shows the most-consumed — that's the one that will cut
-// you off first — tagged with the model's initial; the dropdown lists them all.
-function render(S, W, XL, note){
+// XL holds the scoped weekly limits (per-model caps such as Fable); E the budget-style
+// limits (dollar allowances) newer plans use. The menu bar has room for one of them,
+// so it shows the most-consumed — that's the one that will cut you off first — tagged
+// with its initial; the dropdown lists them all. S is null on current plans, which
+// have no session (5h) limit; its segment/row simply disappears.
+function render(S, W, XL, E, note){
   const scoped=(XL||[]).slice().sort((a,b)=>(b.percent??0)-(a.percent??0));
-  const X=scoped[0]||null, xp=Math.round(X?.percent??0);
+  const extras=(E||[]).slice().sort((a,b)=>(b.percent??0)-(a.percent??0));
+  const X=[...scoped,...extras].sort((a,b)=>(b.percent??0)-(a.percent??0))[0]||null;
+  const xp=Math.round(X?.percent??0);
   const sp=Math.round(S?.percent??0), wp=Math.round(W?.percent??0);
-  const segs=X
-    ? [{pct:sp,col:rgb(sp,S?.severity),w:50},{pct:wp,col:rgb(wp,W?.severity),w:40},{pct:xp,col:rgb(xp,X.severity),w:40}]
-    : [{pct:sp,col:rgb(sp,S?.severity),w:56},{pct:wp,col:rgb(wp,W?.severity),w:48}];
-  const tag=X?((X.name||'S')[0]||'S').toUpperCase():'';
-  const summary = `${sp}% ${cd(S?.resets_at)}  ·  W ${wp}%${X?`  ·  ${tag} ${xp}%`:''}`;
+  const segs=[
+    ...(S?[{pct:sp,col:rgb(sp,S.severity),w:X?50:56}]:[]),
+    {pct:wp,col:rgb(wp,W?.severity),w:S?(X?40:48):56},
+    ...(X?[{pct:xp,col:rgb(xp,X.severity),w:S?40:48}]:[]),
+  ];
+  const tag=X?((X.name||'X')[0]||'X').toUpperCase():'';
+  const summary = `${S?`${sp}% ${cd(S.resets_at)}  ·  `:''}W ${wp}%${X?`  ·  ${tag} ${xp}%`:''}`;
   if (STYLE === 'full') line(`${summary} | image=${barsPNG(segs)}`);
   else {
-    // Outer ring and the number: the 5-hour session, the one that moves minute to
-    // minute. Inner ring: the tighter of the weekly limits (all-model or per-model).
-    const wk = [{p:wp, sev:W?.severity}, ...(X ? [{p:xp, sev:X.severity}] : [])].reduce((m, c) => (c.p > m.p ? c : m));
+    // Outer ring and the number: the session when the plan has one (the limit that
+    // moves minute to minute), else the tightest limit overall. Inner ring: the
+    // tightest of the rest.
+    const all=[S&&{p:sp,sev:S.severity}, W&&{p:wp,sev:W.severity}, X&&{p:xp,sev:X.severity}].filter(Boolean);
+    const outer = S ? all[0] : all.reduce((m,c)=>(c.p>m.p?c:m), {p:0,sev:'normal'});
+    const rest = all.filter(c=>c!==outer);
+    const inner = rest.length ? rest.reduce((m,c)=>(c.p>m.p?c:m)) : {p:0,sev:'normal'};
     const icon = ringsPNG([
-      {pct: sp, col: rgb(sp, S?.severity), R: 12.25, half: 1.6},
-      {pct: wk.p, col: rgb(wk.p, wk.sev), R: 7.1, half: 1.6},
+      {pct: outer.p, col: rgb(outer.p, outer.sev), R: 12.25, half: 1.6},
+      {pct: inner.p, col: rgb(inner.p, inner.sev), R: 7.1, half: 1.6},
     ], !!note);
-    line(`${STYLE === 'compact' ? sp + '%' : ''} | image=${icon} tooltip="${summary}"`);
+    line(`${STYLE === 'compact' ? outer.p + '%' : ''} | image=${icon} tooltip="${summary}"`);
   }
   line('---');
   const pl = sub || cache?.sub;   // no creds on this Mac: the plan the cached reading carries
@@ -274,9 +285,11 @@ function render(S, W, XL, note){
     line(`${name}   ${p}% | image=${miniBarPNG(p, rgb(p, sev))}`);
     line(`Resets ${clock(at)} · in ${cd(at)} | size=11 color=#8E8E93`);
   };
-  row('Session · 5h', sp, S?.severity, S?.resets_at);
+  if (S) row('Session · 5h', sp, S.severity, S.resets_at);
   row('Weekly', wp, W?.severity, W?.resets_at);
   for (const l of scoped) row(`Weekly · ${l.name}`, Math.round(l.percent??0), l.severity, l.resets_at);
+  for (const l of extras) row(l.limit!=null?`${l.name} · $${Math.round(l.used??0)}/$${l.limit}`:l.name,
+    Math.round(l.percent??0), l.severity, l.resets_at);
   line('---');
   line('Refresh | refresh=true');
   styleMenu();
@@ -295,7 +308,7 @@ const coolNote = (ts, wait) => quiet(ts) ? null
 
 const cache = readCache();
 // Throttle guard: reuse a recent success and don't hit the API.
-if (cache && cache.ts > 0 && ageOf(cache.ts) < THROTTLE_MS) render(cache.S, cache.W, cache.XL);
+if (cache && cache.ts > 0 && ageOf(cache.ts) < THROTTLE_MS) render(cache.S, cache.W, cache.XL, cache.E);
 
 // Another machine may have already paid for this data — reuse it rather than
 // spending a second request against the shared account-level limit. Its ts is kept
@@ -304,26 +317,28 @@ const sh = await readShared();
 if (!sub && sh?.sub) sub = sh.sub;   // peer knows the plan even if we have no creds
 const shHasData = !!(sh && sh.ts > 0 && (sh.S || sh.W));
 if (shHasData && ageOf(sh.ts) < (isHub(sharedPath()) ? HUB_TTL : SHARED_TTL)) {
-  writeCache({sub: sh.sub ?? sub, S: sh.S, W: sh.W, XL: sh.XL, ts: sh.ts, blockedUntil: sh.blockedUntil});
-  render(sh.S, sh.W, sh.XL);
+  writeCache({sub: sh.sub ?? sub, S: sh.S, W: sh.W, XL: sh.XL, E: sh.E, ts: sh.ts, blockedUntil: sh.blockedUntil});
+  render(sh.S, sh.W, sh.XL, sh.E);
 }
 
 // ...or another tool on this machine (the MCP server, Loop's engine) — same rules.
 const xt = readXTool();
 const xtHasData = !!(xt && typeof xt.ts === 'number' && xt.ts > 0 && xt.reading?.ok && (xt.reading.session || xt.reading.weekly));
 const xtView = () => ({S: fromXT(xt.reading.session), W: fromXT(xt.reading.weekly),
-  XL: (xt.reading.scoped || []).map(l => ({...fromXT(l), name: l.name})), ts: xtoolTakenAt(xt)});
+  XL: (xt.reading.scoped || []).map(l => ({...fromXT(l), name: l.name})),
+  E: (xt.reading.extras || []).map(l => ({...fromXT(l), name: l.name, used: l.used ?? null, limit: l.limit ?? null})),
+  ts: xtoolTakenAt(xt)});
 if (!sub && xtHasData && xt.reading.subscription) sub = xt.reading.subscription;
 if (xtHasData && ageOf(xtoolTakenAt(xt)) < SHARED_TTL) {
   const v = xtView();
-  writeCache({sub, S: v.S, W: v.W, XL: v.XL, ts: v.ts, blockedUntil: xt.blockedUntil});
-  render(v.S, v.W, v.XL);
+  writeCache({sub, S: v.S, W: v.W, XL: v.XL, E: v.E, ts: v.ts, blockedUntil: xt.blockedUntil});
+  render(v.S, v.W, v.XL, v.E);
 }
 
 // newest of whatever we can still draw from when the API is unavailable
 const fallback = () => [
-  (cache && cache.ts > 0 && (cache.S || cache.W)) ? {S:cache.S, W:cache.W, XL:cache.XL, ts:cache.ts} : null,
-  shHasData ? {S:sh.S, W:sh.W, XL:sh.XL, ts:sh.ts} : null,
+  (cache && cache.ts > 0 && (cache.S || cache.W)) ? {S:cache.S, W:cache.W, XL:cache.XL, E:cache.E, ts:cache.ts} : null,
+  shHasData ? {S:sh.S, W:sh.W, XL:sh.XL, E:sh.E, ts:sh.ts} : null,
   xtHasData ? xtView() : null,
 ].reduce((best, c) => (c && (!best || c.ts > best.ts) ? c : best), null);
 // Publish a cooldown to every cache. The shared entries are merged, never replaced, so
@@ -340,14 +355,14 @@ function recordCooldown(until){
 const wait = Math.max(waitFor(cache?.blockedUntil), waitFor(sh?.blockedUntil), waitFor(xt?.blockedUntil));
 if (wait > 0) {
   const f = fallback();
-  if (f) render(f.S, f.W, f.XL, coolNote(f.ts, wait));
+  if (f) render(f.S, f.W, f.XL, f.E, coolNote(f.ts, wait));
   bad(`Rate-limited — retrying in ${cd(new Date(Date.now()+wait).toISOString())}`);
 }
 
 // Only now does a missing token matter — nothing above needed one.
 if (!tok) {
   const f = fallback();
-  if (f) render(f.S, f.W, f.XL, '⚠ Not signed in on this Mac — showing shared data (claude /login, or point it at a hub)');
+  if (f) render(f.S, f.W, f.XL, f.E, '⚠ Not signed in on this Mac — showing shared data (claude /login, or point it at a hub)');
   bad('Not signed in — run `claude` then /login, or point this Mac at a hub (~/.config/claude-usage-bar/shared-cache-path)');
 }
 
@@ -358,19 +373,19 @@ try {
   });
   if (res.status===401||res.status===403) {
     const f = fallback();
-    if (f) render(f.S, f.W, f.XL, `⚠ ${authHint}`);
+    if (f) render(f.S, f.W, f.XL, f.E, `⚠ ${authHint}`);
     bad(authHint);
   }
   if (res.status === 429) {
     const until = cooldownFrom(res);
     recordCooldown(until);
     const f = fallback();
-    if (f) render(f.S, f.W, f.XL, coolNote(f.ts, until - Date.now()));
+    if (f) render(f.S, f.W, f.XL, f.E, coolNote(f.ts, until - Date.now()));
     bad(`Rate-limited — retrying in ${cd(new Date(until).toISOString())}`);
   }
   if (!res.ok) {
     const f = fallback();
-    if (f) render(f.S, f.W, f.XL, staleNote(f.ts));
+    if (f) render(f.S, f.W, f.XL, f.E, staleNote(f.ts));
     bad('HTTP '+res.status);
   }
   const d = await res.json();
@@ -383,15 +398,26 @@ try {
     percent:l.percent, resets_at:l.resets_at, severity:l.severity??'normal',
     name:l.scope?.model?.display_name||l.scope?.surface||'scoped',
   }));
+  // Budget-style limits (dollar allowances) newer plans use: extra top-level objects
+  // under rotating codenamed keys, NOT in limits[] — often the only limit with real
+  // utilization. Match the shape, not the name, so a renamed field still shows up.
+  const EXTRA_SKIP = /^(five_hour|seven_day|extra_usage|spend|pace|promo)/;
+  const E = Object.entries(d)
+    .filter(([k,v]) => !EXTRA_SKIP.test(k) && v && typeof v==='object'
+      && typeof v.utilization==='number' && v.resets_at)
+    .map(([k,v]) => ({name: v.limit_dollars!=null ? 'Budget' : k.replace(/_/g,' '),
+      percent: Math.round(v.utilization), resets_at: v.resets_at, severity: 'normal',
+      used: v.used_dollars ?? null, limit: v.limit_dollars ?? null}))
+    .sort((a,b) => b.percent - a.percent);
   const now = Date.now();
   // omitting blockedUntil clears any cooldown: the budget is evidently back
-  writeCache({sub, S, W, XL, ts: now});
-  writeShared({v:1, ts: now, sub, S, W, XL});
-  writeAtomic(XTOOL, {reading: toXT(S, W, XL, now), ts: now});   // the local tools reuse this fetch
-  render(S, W, XL);
+  writeCache({sub, S, W, XL, E, ts: now});
+  writeShared({v:1, ts: now, sub, S, W, XL, E});
+  writeAtomic(XTOOL, {reading: toXT(S, W, XL, E, now), ts: now});   // the local tools reuse this fetch
+  render(S, W, XL, E);
 } catch(e) {
   const f = fallback();
-  if (f) render(f.S, f.W, f.XL, staleNote(f.ts));
+  if (f) render(f.S, f.W, f.XL, f.E, staleNote(f.ts));
   bad('Network error');
 }
 JS

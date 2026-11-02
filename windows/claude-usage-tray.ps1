@@ -168,15 +168,21 @@ function ConvertTo-XToolLimit($x, [double]$nowMs) {
   $sev = if ($x.severity) { $x.severity } else { 'normal' }
   return [pscustomobject]@{ percent = [int][math]::Round([double]$x.percent); resetsAt = $iso; resetsInMinutes = $mins; severity = $sev }
 }
-function New-XToolReading($S, $W, $XL, $sub, [double]$nowMs) {
+function New-XToolReading($S, $W, $XL, $E, $sub, [double]$nowMs) {
   $scoped = @(@($XL) | Where-Object { $_ } | ForEach-Object {
     ConvertTo-XToolLimit $_ $nowMs | Add-Member -NotePropertyName name -NotePropertyValue $_.name -PassThru
+  } | Sort-Object { [double]$_.percent } -Descending)
+  $extras = @(@($E) | Where-Object { $_ } | ForEach-Object {
+    ConvertTo-XToolLimit $_ $nowMs |
+      Add-Member -NotePropertyName name -NotePropertyValue $_.name -PassThru |
+      Add-Member -NotePropertyName used -NotePropertyValue $_.used -PassThru |
+      Add-Member -NotePropertyName limit -NotePropertyValue $_.limit -PassThru
   } | Sort-Object { [double]$_.percent } -Descending)
   return [pscustomobject]@{
     ok = $true; subscription = $sub
     fetchedAt = (Get-IsoString ([DateTimeOffset]::FromUnixTimeMilliseconds([long]$nowMs)))
     session = (ConvertTo-XToolLimit $S $nowMs); weekly = (ConvertTo-XToolLimit $W $nowMs)
-    scoped = $scoped
+    scoped = $scoped; extras = $extras
   }
 }
 function Get-XToolView($xt, [double]$takenAt, $fallbackSub) {
@@ -184,7 +190,13 @@ function Get-XToolView($xt, [double]$takenAt, $fallbackSub) {
   $XL = @(@($xt.reading.scoped) | Where-Object { $_ } | ForEach-Object {
     ConvertFrom-XToolLimit $_ | Add-Member -NotePropertyName name -NotePropertyValue $_.name -PassThru
   })
-  return [pscustomobject]@{ S = (ConvertFrom-XToolLimit $xt.reading.session); W = (ConvertFrom-XToolLimit $xt.reading.weekly); XL = $XL; sub = $sub; ts = $takenAt }
+  $E = @(@($xt.reading.extras) | Where-Object { $_ } | ForEach-Object {
+    ConvertFrom-XToolLimit $_ |
+      Add-Member -NotePropertyName name -NotePropertyValue $_.name -PassThru |
+      Add-Member -NotePropertyName used -NotePropertyValue $_.used -PassThru |
+      Add-Member -NotePropertyName limit -NotePropertyValue $_.limit -PassThru
+  })
+  return [pscustomobject]@{ S = (ConvertFrom-XToolLimit $xt.reading.session); W = (ConvertFrom-XToolLimit $xt.reading.weekly); XL = $XL; E = $E; sub = $sub; ts = $takenAt }
 }
 
 # ---- 429 cooldown ----
@@ -341,10 +353,10 @@ function Write-Cache($obj) {
 # Loop's engine may have written it since we looked.
 function Publish-Cooldown([double]$until, $cache, $sh) {
   $c = if ($cache) { $cache } else { [pscustomobject]@{ ts = 0 } }
-  Write-Cache ([pscustomobject]@{ sub = $c.sub; S = $c.S; W = $c.W; XL = $c.XL; ts = $c.ts; blockedUntil = $until })
+  Write-Cache ([pscustomobject]@{ sub = $c.sub; S = $c.S; W = $c.W; XL = $c.XL; E = $c.E; ts = $c.ts; blockedUntil = $until })
   if (Get-SharedPath) {
     $o = if ($sh) { $sh } else { [pscustomobject]@{ ts = 0 } }
-    Write-Shared ([pscustomobject]@{ v = 1; ts = $o.ts; sub = $o.sub; S = $o.S; W = $o.W; XL = $o.XL; blockedUntil = $until })
+    Write-Shared ([pscustomobject]@{ v = 1; ts = $o.ts; sub = $o.sub; S = $o.S; W = $o.W; XL = $o.XL; E = $o.E; blockedUntil = $until })
   }
   $x = Read-XTool
   $merged = [ordered]@{ ts = 0 }
@@ -385,32 +397,38 @@ function Set-Tray([IntPtr]$hicon, [string[]]$tips) {
   $script:LastHicon = $hicon
 }
 
-# $XL holds the scoped weekly limits (per-model caps such as Fable). The icon has
-# room for one row, so it gets the most-consumed — that's the one that will cut you
-# off first — while the tooltip lists them all. The tooltip is built in shrinking
-# versions, because on Windows PowerShell 5.1 it has only 63 chars: first the reset
-# clocks go, then the "Claude - max" header, then the note is shortened and the
-# limits share one line.
-function Render($S, $W, $XL, $sub, $note) {
-  $sp = [int][math]::Round([double]$S.percent)
+# $XL holds the scoped weekly limits (per-model caps such as Fable), $E the
+# budget-style limits (dollar allowances) newer plans use. The icon has room for one
+# row besides session/weekly, so it gets the most-consumed — that's the one that will
+# cut you off first — while the tooltip lists them all. $S is $null on current plans,
+# which have no session (5h) limit; its row simply disappears. The tooltip is built
+# in shrinking versions, because on Windows PowerShell 5.1 it has only 63 chars:
+# first the reset clocks go, then the "Claude - max" header, then the note is
+# shortened and the limits share one line.
+function Render($S, $W, $XL, $E, $sub, $note) {
+  $bars = @(); $full = @(); $short = @(); $one = ''
+  if ($S) {
+    $sp = [int][math]::Round([double]$S.percent)
+    $bars += @{ pct = $sp; col = (Get-Sev-Color $sp $S.severity) }
+    $full  += "Session $sp%  $(Get-Countdown $S.resets_at)  (resets $(Get-Clock $S.resets_at))"
+    $short += "Session $sp%  $(Get-Countdown $S.resets_at)"
+    $one = "S $sp%  "
+  }
   $wp = [int][math]::Round([double]$W.percent)
-  $bars = @(
-    @{ pct = $sp; col = (Get-Sev-Color $sp $S.severity) },
-    @{ pct = $wp; col = (Get-Sev-Color $wp $W.severity) }
-  )
+  $bars += @{ pct = $wp; col = (Get-Sev-Color $wp $W.severity) }
   $head = "Claude$(if ($sub) { " - $sub" })"
-  $full = @("Session $sp%  $(Get-Countdown $S.resets_at)  (resets $(Get-Clock $S.resets_at))",
-            "Weekly $wp%  $(Get-Countdown $W.resets_at)  (resets $(Get-Clock $W.resets_at))")
-  $short = @("Session $sp%  $(Get-Countdown $S.resets_at)", "Weekly $wp%  $(Get-Countdown $W.resets_at)")
-  $one = "S $sp%  W $wp%"
+  $full  += "Weekly $wp%  $(Get-Countdown $W.resets_at)  (resets $(Get-Clock $W.resets_at))"
+  $short += "Weekly $wp%  $(Get-Countdown $W.resets_at)"
+  $one += "W $wp%"
 
-  $scoped = @(@($XL) | Where-Object { $_ } | Sort-Object { [double]$_.percent } -Descending)
-  if ($scoped.Count -gt 0) {
-    $xp = [int][math]::Round([double]$scoped[0].percent)
-    $bars += @{ pct = $xp; col = (Get-Sev-Color $xp $scoped[0].severity) }
-    foreach ($l in $scoped) {
+  $others = @(@(@($XL) + @($E)) | Where-Object { $_ } | Sort-Object { [double]$_.percent } -Descending)
+  if ($others.Count -gt 0) {
+    $xp = [int][math]::Round([double]$others[0].percent)
+    $bars += @{ pct = $xp; col = (Get-Sev-Color $xp $others[0].severity) }
+    foreach ($l in $others) {
       $lp = [int][math]::Round([double]$l.percent)
-      $line = "$($l.name) $lp%  $(Get-Countdown $l.resets_at)"
+      $nm = if ($null -ne $l.limit) { ('{0} ${1}/${2}' -f $l.name, [int][math]::Round([double]$l.used), [int]$l.limit) } else { $l.name }
+      $line = "$nm $lp%  $(Get-Countdown $l.resets_at)"
       $full += $line; $short += $line
       $one += "  $($l.name) $lp%"
     }
@@ -450,7 +468,7 @@ function Update-Bar {
 
   # throttle guard: reuse a recent success without hitting the API
   if ((-not $Force) -and $haveCache -and ((Get-Age ([double]$cache.ts)) -lt $ThrottleMs)) {
-    Render $cache.S $cache.W $cache.XL $cache.sub $null
+    Render $cache.S $cache.W $cache.XL $cache.E $cache.sub $null
     return
   }
 
@@ -464,8 +482,8 @@ function Update-Bar {
   $sharedFresh = if (Test-Hub (Get-SharedPath)) { $haveShared -and ((Get-Age ([double]$sh.ts)) -lt $HubTtlMs) }
                  else { (-not $Force) -and $haveShared -and ((Get-Age ([double]$sh.ts)) -lt $SharedTtlMs) }
   if ($sharedFresh) {
-    Write-Cache ([pscustomobject]@{ sub = $sh.sub; S = $sh.S; W = $sh.W; XL = $sh.XL; ts = $sh.ts; blockedUntil = $sh.blockedUntil })
-    Render $sh.S $sh.W $sh.XL $sh.sub $null
+    Write-Cache ([pscustomobject]@{ sub = $sh.sub; S = $sh.S; W = $sh.W; XL = $sh.XL; E = $sh.E; ts = $sh.ts; blockedUntil = $sh.blockedUntil })
+    Render $sh.S $sh.W $sh.XL $sh.E $sh.sub $null
     return
   }
 
@@ -474,17 +492,17 @@ function Update-Bar {
   $haveXT = $xt -and ([double]$xt.ts -gt 0) -and $xt.reading -and $xt.reading.ok -and ($xt.reading.session -or $xt.reading.weekly)
   $xv = if ($haveXT) { Get-XToolView $xt (Get-XToolTakenAt $xt) $cache.sub } else { $null }
   if ((-not $Force) -and $haveXT -and ((Get-Age $xv.ts) -lt $SharedTtlMs)) {
-    Write-Cache ([pscustomobject]@{ sub = $xv.sub; S = $xv.S; W = $xv.W; XL = $xv.XL; ts = $xv.ts; blockedUntil = $xt.blockedUntil })
-    Render $xv.S $xv.W $xv.XL $xv.sub $null
+    Write-Cache ([pscustomobject]@{ sub = $xv.sub; S = $xv.S; W = $xv.W; XL = $xv.XL; E = $xv.E; ts = $xv.ts; blockedUntil = $xt.blockedUntil })
+    Render $xv.S $xv.W $xv.XL $xv.E $xv.sub $null
     return
   }
 
   # newest of whatever we can still draw from - a peer's reading beats a blank icon,
   # including on a PC that was never signed in
   $fb = $null
-  if ($haveCache) { $fb = [pscustomobject]@{ S = $cache.S; W = $cache.W; XL = $cache.XL; sub = $cache.sub; ts = [double]$cache.ts } }
+  if ($haveCache) { $fb = [pscustomobject]@{ S = $cache.S; W = $cache.W; XL = $cache.XL; E = $cache.E; sub = $cache.sub; ts = [double]$cache.ts } }
   if ($haveShared -and ((-not $fb) -or ([double]$sh.ts -gt $fb.ts))) {
-    $fb = [pscustomobject]@{ S = $sh.S; W = $sh.W; XL = $sh.XL; sub = $sh.sub; ts = [double]$sh.ts }
+    $fb = [pscustomobject]@{ S = $sh.S; W = $sh.W; XL = $sh.XL; E = $sh.E; sub = $sh.sub; ts = [double]$sh.ts }
   }
   if ($haveXT -and ((-not $fb) -or ($xv.ts -gt $fb.ts))) { $fb = $xv }
 
@@ -495,7 +513,7 @@ function Update-Bar {
     if ($fb) {
       $age = Get-AgeText (Get-Age $fb.ts)
       $shown = if ((Get-Age $fb.ts) -lt $QuietStaleMs) { $null } else { "$note (cached $age ago)" }
-      Render $fb.S $fb.W $fb.XL $fb.sub $shown
+      Render $fb.S $fb.W $fb.XL $fb.E $fb.sub $shown
     } else { Show-Error $note }
     return
   }
@@ -526,13 +544,29 @@ function Update-Bar {
       [pscustomobject]@{ percent = $_.percent; resets_at = $_.resets_at; severity = $_.severity; name = $nm }
     })
 
+    # Budget-style limits (dollar allowances) newer plans use: extra top-level objects
+    # under rotating codenamed keys with {utilization, resets_at, limit_dollars...},
+    # NOT in limits[] - often the only limit with real utilization. Match the shape,
+    # not the name, so a renamed field still shows up.
+    $E = @()
+    foreach ($pr in $d.PSObject.Properties) {
+      if ($pr.Name -match '^(five_hour|seven_day|extra_usage|spend|pace|promo)') { continue }
+      $v = $pr.Value
+      if ($null -eq $v -or $v -isnot [pscustomobject]) { continue }
+      if ($null -eq $v.utilization -or -not $v.resets_at) { continue }
+      $nm = if ($null -ne $v.limit_dollars) { 'Budget' } else { $pr.Name -replace '_', ' ' }
+      $E += [pscustomobject]@{ name = $nm; percent = [math]::Round([double]$v.utilization); resets_at = $v.resets_at
+        severity = 'normal'; used = $v.used_dollars; limit = $v.limit_dollars }
+    }
+    $E = @($E | Sort-Object { [double]$_.percent } -Descending)
+
     # a success clears the cooldown on both caches (blockedUntil simply omitted)
-    Write-Cache ([pscustomobject]@{ sub = $auth.sub; S = $S; W = $W; XL = $XL; ts = $nowMs })
+    Write-Cache ([pscustomobject]@{ sub = $auth.sub; S = $S; W = $W; XL = $XL; E = $E; ts = $nowMs })
     # Publish for the other machines/apps sharing this account's request budget.
-    Write-Shared ([pscustomobject]@{ v = 1; ts = $nowMs; sub = $auth.sub; S = $S; W = $W; XL = $XL })
+    Write-Shared ([pscustomobject]@{ v = 1; ts = $nowMs; sub = $auth.sub; S = $S; W = $W; XL = $XL; E = $E })
     # ...and for the tools on this PC, so they reuse this fetch instead of making their own.
-    Write-Atomic $XToolPath ([pscustomobject]@{ reading = (New-XToolReading $S $W $XL $auth.sub $nowMs); ts = $nowMs })
-    Render $S $W $XL $auth.sub $null
+    Write-Atomic $XToolPath ([pscustomobject]@{ reading = (New-XToolReading $S $W $XL $E $auth.sub $nowMs); ts = $nowMs })
+    Render $S $W $XL $E $auth.sub $null
   }
   catch {
     $code = $null
@@ -554,7 +588,7 @@ function Update-Bar {
               elseif ($code) { "API $code - cached $age ago" }
               else { "offline - cached $age ago" }
       if ((Get-Age $fb.ts) -lt $QuietStaleMs) { $note = $null }
-      Render $fb.S $fb.W $fb.XL $fb.sub $note
+      Render $fb.S $fb.W $fb.XL $fb.E $fb.sub $note
     }
     elseif ($coolNote) { Show-Error $coolNote }
     elseif (-not $auth) { Show-Error "Not signed in - run claude then /login, or point this PC at a hub (shared-cache-path)" }
