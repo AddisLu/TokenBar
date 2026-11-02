@@ -167,12 +167,15 @@ class Indicator extends PanelMenu.Button {
         let s = data.session;
         if (s && s.kind && s.kind !== 'session') s = null;
         const w = (data.limits || []).find(l => l.kind === 'weekly_all');
-        // Per-model weekly caps (Fable today, Opus before it) and budget-style
-        // limits. The panel has room for one, so it shows the most-consumed —
-        // that's the one that will cut you off first — while the dropdown lists them all.
+        // Per-model weekly caps (Fable today, Opus before it). The panel has room
+        // for one, so it shows the most-consumed — that's the one that will cut you
+        // off first — while the dropdown lists them all. Credit pools (kind 'extra')
+        // are informational — running one out doesn't lock the account — so they get
+        // a dropdown line but never a panel bar.
         const scoped = (data.limits || [])
-            .filter(l => l.kind === 'weekly_scoped' || l.kind === 'extra')
+            .filter(l => l.kind === 'weekly_scoped')
             .sort((a, b) => (b.percent ?? 0) - (a.percent ?? 0));
+        const extras = (data.limits || []).filter(l => l.kind === 'extra');
 
         // session (panel bar + countdown) — hidden on plans without one
         this._mSession.visible = !!s;
@@ -205,14 +208,15 @@ class Indicator extends PanelMenu.Button {
             setBar(this._xBar, x.percent, colorFor(x.percent, x.severity));
             this._xLabel0.text = ((x.scopeName || 'S')[0] || 'S').toUpperCase();
             this._xLabel.text = `${x.percent}%`;
-            this._mScoped.visible = true;
-            this._mScoped.label.text = scoped
-                .map(l => `${l.label}: ${l.percent}%   resets ${l.resetsAt ? fmtReset(l.resetsAt) : 'n/a'}`)
-                .join('\n');
         } else {
             this._showScoped(false);
-            this._mScoped.visible = false;
         }
+        const rows = [...scoped, ...extras];
+        this._mScoped.visible = rows.length > 0;
+        this._mScoped.label.text = rows
+            .map(l => `${l.label}: ${l.percent}%   ${l.kind === 'extra' ? 'expires' : 'resets'} ` +
+                `${l.resetsAt ? fmtReset(l.resetsAt) : 'n/a'}`)
+            .join('\n');
 
         this._mTitle.label.text = `Claude Usage${data.subscription ? ' — ' + data.subscription : ''}`;
         const stamp = `Updated ${new Date(data.fetchedAt).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;

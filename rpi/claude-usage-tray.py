@@ -430,10 +430,11 @@ class Tray:
         if s and s.get('kind') != 'session':
             s = None
         w = next((l for l in limits if l.get('kind') == 'weekly_all'), None)
-        # Per-model weekly caps (Fable today) and budget-style limits. The icon has
-        # room for one bar besides the weekly, so it shows whichever of these will
-        # cut you off first; the menu lists them all.
-        others = sorted((l for l in limits if l.get('kind') in ('weekly_scoped', 'extra')),
+        # Per-model weekly caps (Fable today). The icon has room for one bar besides
+        # the weekly, so it shows whichever will cut you off first; the menu lists
+        # them all. Credit pools (kind 'extra') are informational — running one out
+        # doesn't lock the account — so they appear in the menu only.
+        others = sorted((l for l in limits if l.get('kind') == 'weekly_scoped'),
                         key=lambda l: l.get('percent') or 0, reverse=True)
 
         sub = d.get('subscription')
@@ -458,7 +459,8 @@ class Tray:
             x = others[0]
             tip.append(f"{(x.get('scopeName') or 'X')[0].upper()} {x['percent']}%")
         # one menu line per limit, whatever kinds the plan has today
-        lines += [f"{l['label']}: {l['percent']}%   resets {fmt_reset(l.get('resetsAt'))}"
+        lines += [f"{l['label']}: {l['percent']}%   "
+                  f"{'expires' if l.get('kind') == 'extra' else 'resets'} {fmt_reset(l.get('resetsAt'))}"
                   for l in limits]
 
         if d.get('stale') and (d.get('cacheAgeSec') or 0) > QUIET_STALE_SEC:
@@ -479,8 +481,9 @@ class Tray:
 
         summary = '  ·  '.join(tip)
         # the icon's number: the session when the plan has one, else the limit that
-        # will cut you off first — the number the whole icon exists to show
-        prime = s or max(limits, key=lambda l: l.get('percent') or 0, default=None)
+        # will cut you off first — never a credit pool, which cuts nothing off
+        caps = [l for l in limits if l.get('kind') != 'extra']
+        prime = s or max(caps or limits, key=lambda l: l.get('percent') or 0, default=None)
         self._publish(f"{prime['percent']}" if prime else '–', bars or [(0, GREY)], True,
                       summary, f'Claude  {summary}', lines)
 

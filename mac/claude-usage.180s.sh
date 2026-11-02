@@ -243,15 +243,17 @@ const clock=(iso)=>iso?new Date(iso).toLocaleString([],{weekday:'short',hour:'2-
 // Draw the menu bar + dropdown from S/W/XL/E. Countdowns are recomputed live, so even
 // a cached reading shows an accurate reset timer. `note` (optional) is shown dimmed
 // in the dropdown to explain a stale/fallback state.
-// XL holds the scoped weekly limits (per-model caps such as Fable); E the budget-style
-// limits (dollar allowances) newer plans use. The menu bar has room for one of them,
-// so it shows the most-consumed — that's the one that will cut you off first — tagged
-// with its initial; the dropdown lists them all. S is null on current plans, which
-// have no session (5h) limit; its segment/row simply disappears.
+// XL holds the scoped weekly limits (per-model caps such as Fable). The menu bar has
+// room for one, so it shows the most-consumed — that's the one that will cut you off
+// first — tagged with its initial; the dropdown lists them all. E holds credit pools
+// (e.g. cloud-session credits): informational, not caps — running one out doesn't
+// lock the account — so they get a dropdown row but never a segment, ring or the
+// number. S is null on current plans, which have no session (5h) limit; its
+// segment/row simply disappears.
 function render(S, W, XL, E, note){
   const scoped=(XL||[]).slice().sort((a,b)=>(b.percent??0)-(a.percent??0));
   const extras=(E||[]).slice().sort((a,b)=>(b.percent??0)-(a.percent??0));
-  const X=[...scoped,...extras].sort((a,b)=>(b.percent??0)-(a.percent??0))[0]||null;
+  const X=scoped[0]||null;
   const xp=Math.round(X?.percent??0);
   const sp=Math.round(S?.percent??0), wp=Math.round(W?.percent??0);
   const segs=[
@@ -281,15 +283,15 @@ function render(S, W, XL, E, note){
   const plan = pl ? pl[0].toUpperCase() + pl.slice(1) : '';
   line(`Claude${plan ? ' · ' + plan : ''} | size=12 color=#8E8E93`);
   if (note) line(`${note} | color=orange`);
-  const row = (name, p, sev, at) => {
+  const row = (name, p, sev, at, verb='Resets') => {
     line(`${name}   ${p}% | image=${miniBarPNG(p, rgb(p, sev))}`);
-    line(`Resets ${clock(at)} · in ${cd(at)} | size=11 color=#8E8E93`);
+    line(`${verb} ${clock(at)} · in ${cd(at)} | size=11 color=#8E8E93`);
   };
   if (S) row('Session · 5h', sp, S.severity, S.resets_at);
   row('Weekly', wp, W?.severity, W?.resets_at);
   for (const l of scoped) row(`Weekly · ${l.name}`, Math.round(l.percent??0), l.severity, l.resets_at);
   for (const l of extras) row(l.limit!=null?`${l.name} · $${Math.round(l.used??0)}/$${l.limit}`:l.name,
-    Math.round(l.percent??0), l.severity, l.resets_at);
+    Math.round(l.percent??0), l.severity, l.resets_at, 'Expires');
   line('---');
   line('Refresh | refresh=true');
   styleMenu();

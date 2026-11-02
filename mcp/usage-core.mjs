@@ -127,10 +127,11 @@ const fromShared = (sh) => ({
     extras: (sh.E || []).map(l => ({...norm(l), name: l.name, used: l.used ?? null, limit: l.limit ?? null})),
 });
 
-// Budget-style limits (dollar allowances) newer plans use: extra top-level objects
-// under rotating codenamed keys with {utilization, resets_at, limit_dollars…}, NOT in
-// limits[] — often the only limit with real utilization while every limits[] entry
-// sits at 0%. Match the shape, not the name, so a renamed field still shows up.
+// Credit pools (e.g. cloud-session credits): extra top-level objects under rotating
+// codenamed keys with {utilization, resets_at, limit_dollars…}, NOT in limits[].
+// Match the shape, not the name, so a renamed field still shows up. Informational,
+// not caps — running one out doesn't lock the account (the plan's regular usage
+// simply applies again) — so they're reported alongside but never as a limit.
 const EXTRA_SKIP = /^(five_hour|seven_day|extra_usage|spend|pace|promo)/;
 function extraLimits(d) {
     const out = [];
@@ -138,7 +139,7 @@ function extraLimits(d) {
         if (EXTRA_SKIP.test(k) || !v || typeof v !== 'object') continue;
         if (typeof v.utilization !== 'number' || !v.resets_at) continue;
         out.push({
-            name: v.limit_dollars != null ? 'Budget' : k.replace(/_/g, ' '),
+            name: v.limit_dollars != null ? 'Credits' : k.replace(/_/g, ' '),
             percent: Math.round(v.utilization), resets_at: v.resets_at, severity: 'normal',
             used: v.used_dollars ?? null, limit: v.limit_dollars ?? null,
         });
@@ -282,8 +283,12 @@ export function humanSummary(u) {
             ...(u.session ? ['• ' + fmt(u.session, 'Session (5h)')] : []),
             '• ' + fmt(u.weekly, 'Weekly'),
             ...(u.scoped || []).map(l => '• ' + fmt(l, `Weekly · ${l.name}`)),
-            ...(u.extras || []).map(l => '• ' + fmt(l,
-                l.limit != null ? `${l.name} ($${Math.round(l.used ?? 0)} of $${l.limit})` : l.name)),
+            // credit pools: informational — running one out is not a lockout
+            ...(u.extras || []).map(l => {
+                const h = l.resetsInMinutes != null ? `${Math.floor(l.resetsInMinutes / 60)}h ${l.resetsInMinutes % 60}m` : 'n/a';
+                const nm = l.limit != null ? `${l.name} ($${Math.round(l.used ?? 0)} of $${l.limit})` : l.name;
+                return `• ${nm}: ${l.percent}% used, expires in ${h} — informational, not a cap`;
+            }),
             // say so rather than passing off a peer's reading as a live one
             ...(u.fromSharedCache ? [`(shared cache, ${u.cacheAgeSeconds}s old — reused to spare the account-level rate limit)`] : []),
             // say plainly that the numbers are frozen, and for how long

@@ -9,7 +9,7 @@ real, server-side numbers (not an estimate from local logs). Because that endpoi
 is **account-level**, every device shows the same combined usage; no syncing needed.
 
 ```
-◉  29%  ·  W 10%  ·  B 29%   ← tightest limit + weekly bar + per-model / budget bar
+◉  10%  ·  W 10%  ·  F 89%   ← tightest limit + weekly bar + per-model bar
 ```
 
 ## What it shows
@@ -18,14 +18,16 @@ is **account-level**, every device shows the same combined usage; no syncing nee
   often the binding limit, sitting near 100% while the all-model weekly is still low.
   The segment only appears on accounts that have one; when several exist the bar shows
   the most-consumed and the dropdown lists them all.
-- **Budget-style limits** (dollar allowances, e.g. `Budget · $71/$250`) — newer plans
-  gate usage with these instead of the old session window. They arrive as extra,
-  codename-keyed fields outside the API's `limits[]` array, so the bars detect them by
-  shape (`utilization` + `resets_at`), not by name; a renamed field still shows up.
+- **Credit pools** (e.g. cloud-session credits, `Credits · $71/$250`) in the dropdown —
+  informational only: running one out doesn't lock the account, the plan's regular
+  usage simply applies again, so they never drive the icon's number, color or an
+  alert. They arrive as extra, codename-keyed fields outside the API's `limits[]`
+  array, so the bars detect them by shape (`utilization` + `resets_at`), not by name;
+  a renamed field still shows up.
 - **Session (5h)** utilization % + reset time — only on accounts that still have one.
   Current Max/Pro plans don't (Anthropic dropped the 5-hour window with the Claude 5
   launch, late 2026), so the session bar simply disappears and the tightest remaining
-  limit takes its place in the icon.
+  cap takes its place in the icon.
 - A compact progress bar, colored green → orange → red
 
 ## Platforms
@@ -182,8 +184,8 @@ signed in to Claude Code once (token read from the macOS Keychain item
 
 The menu bar shows two concentric rings and a percentage, about 46 pt wide, so it fits
 a MacBook Air. The outer ring and the number are the 5-hour session where the plan
-still has one, otherwise the tightest limit overall (weekly, per-model or budget) —
-the one that will cut you off first. The inner ring is the tightest of the rest.
+still has one, otherwise the tightest cap (all-model or per-model weekly) — the one
+that will cut you off first. The inner ring is the tightest of the rest.
 Each ring is green (under 70%), orange (70–89%) or red (90% and up), and both
 fade while the numbers are stale. Click it for every limit, each with its own bar and reset time. The
 dropdown's **Menu bar style** submenu switches between *Icon + %* (the default),
@@ -203,8 +205,8 @@ read from `~/.claude/.credentials.json`).
 cd rpi && bash install-rpi.sh
 ```
 Raspberry Pi OS's desktop is labwc + wf-panel-pi, not GNOME, so the `linux/` extension
-can't load there. This installs a tray icon instead — the tightest limit's % over up to
-two bars (weekly, plus the tightest per-model/budget cap); click it for reset times and
+can't load there. This installs a tray icon instead — the tightest cap's % over up to
+two bars (weekly, plus the tightest per-model cap); click it for reset times and
 "Refresh now". It runs the same `usage-fetch.mjs` as the GNOME extension (copied from
 `linux/` at install time), so caching, the 429 cooldown and the shared cache are identical.
 Starts at login via `~/.config/autostart/`. Prereqs: Node.js, `python3-gi`,
@@ -241,6 +243,6 @@ account's usage from that reading and never need a token of their own.
 - The `oauth/usage` endpoint is unofficial/internal (it's what Claude Code's `/usage`
   uses); Anthropic may change it.
 - The limits shown apply to Max/Pro subscription accounts. Which kinds exist changes
-  over time (the 5-hour session window is gone from current plans; dollar budgets
-  arrived with the Claude 5 generation) — the bars render whatever the endpoint
+  over time (the 5-hour session window is gone from current plans; dollar credit
+  pools arrived with the Claude 5 generation) — the bars render whatever the endpoint
   reports instead of assuming a fixed set.

@@ -421,17 +421,24 @@ function Render($S, $W, $XL, $E, $sub, $note) {
   $short += "Weekly $wp%  $(Get-Countdown $W.resets_at)"
   $one += "W $wp%"
 
-  $others = @(@(@($XL) + @($E)) | Where-Object { $_ } | Sort-Object { [double]$_.percent } -Descending)
-  if ($others.Count -gt 0) {
-    $xp = [int][math]::Round([double]$others[0].percent)
-    $bars += @{ pct = $xp; col = (Get-Sev-Color $xp $others[0].severity) }
-    foreach ($l in $others) {
+  $scoped = @(@($XL) | Where-Object { $_ } | Sort-Object { [double]$_.percent } -Descending)
+  if ($scoped.Count -gt 0) {
+    $xp = [int][math]::Round([double]$scoped[0].percent)
+    $bars += @{ pct = $xp; col = (Get-Sev-Color $xp $scoped[0].severity) }
+    foreach ($l in $scoped) {
       $lp = [int][math]::Round([double]$l.percent)
-      $nm = if ($null -ne $l.limit) { ('{0} ${1}/${2}' -f $l.name, [int][math]::Round([double]$l.used), [int]$l.limit) } else { $l.name }
-      $line = "$nm $lp%  $(Get-Countdown $l.resets_at)"
+      $line = "$($l.name) $lp%  $(Get-Countdown $l.resets_at)"
       $full += $line; $short += $line
       $one += "  $($l.name) $lp%"
     }
+  }
+  # Credit pools (e.g. cloud-session credits): informational, not caps - running one
+  # out doesn't lock the account, so they get a tooltip line but never a bar row.
+  foreach ($l in @(@($E) | Where-Object { $_ })) {
+    $lp = [int][math]::Round([double]$l.percent)
+    $nm = if ($null -ne $l.limit) { ('{0} ${1}/${2}' -f $l.name, [int][math]::Round([double]$l.used), [int]$l.limit) } else { $l.name }
+    $line = "$nm $lp%  $(Get-Countdown $l.resets_at)"
+    $full += $line; $short += $line
   }
 
   # "rate-limited - retrying in 16m (cached 11d ago)" -> "rate-limited, retry in 16m, 11d old"

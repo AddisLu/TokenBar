@@ -230,10 +230,12 @@ function label(l) {
 }
 const RANK = {session: 0, daily: 1, weekly_all: 2, weekly_scoped: 3, extra: 4};
 
-// Newer plans gate usage with budget-style limits (dollar allowances) that arrive as
-// extra top-level objects under rotating codenamed keys and are NOT in limits[] —
-// often the only limit with real utilization while every limits[] entry sits at 0%.
-// Scan for the shape rather than the name, so a renamed field still shows up.
+// Credit pools (e.g. cloud-session credits) arrive as extra top-level objects under
+// rotating codenamed keys with {utilization, resets_at, limit_dollars…}, NOT in
+// limits[]. Scan for the shape rather than the name, so a renamed field still shows
+// up. These are informational, not caps: running one out doesn't lock the account
+// (the plan's regular usage simply applies again), so the panels list them in the
+// dropdown but never let them drive the icon's number, color or any alert.
 const EXTRA_SKIP = /^(five_hour|seven_day|extra_usage|spend|pace|promo)/;
 function extraLimits(d) {
     const out = [];
@@ -242,7 +244,7 @@ function extraLimits(d) {
         if (typeof v.utilization !== 'number' || !v.resets_at) continue;
         const dollars = v.limit_dollars != null;
         out.push({
-            name: dollars ? 'Budget' : k.replace(/_/g, ' '),
+            name: dollars ? 'Credits' : k.replace(/_/g, ' '),
             percent: Math.round(v.utilization),
             resets_at: v.resets_at,
             severity: 'normal',
