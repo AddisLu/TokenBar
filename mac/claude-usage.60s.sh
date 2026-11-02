@@ -344,7 +344,10 @@ if (!isHub(sharedPath()) && cache && cache.ts > 0 && ageOf(cache.ts) < THROTTLE_
 // spending a second request against the shared account-level limit. Its ts is kept
 // verbatim so "cached Ns ago" stays honest and the next poll re-evaluates correctly.
 const sh = await readShared();
-if (!sub && sh?.sub) sub = sh.sub;   // peer knows the plan even if we have no creds
+// The peer's label beats our sign-in-time subscriptionType: a hub (or any peer on the
+// current code) reads the authoritative plan_display_label, while the Keychain still
+// says "max" after an upgrade to Ultra.
+if (sh?.sub) sub = sh.sub;
 const shHasData = !!(sh && sh.ts > 0 && (sh.S || sh.W));
 if (shHasData && ageOf(sh.ts) < (isHub(sharedPath()) ? HUB_TTL : SHARED_TTL)) {
   writeCache({sub: sh.sub ?? sub, S: sh.S, W: sh.W, XL: sh.XL, E: sh.E, ts: sh.ts, blockedUntil: sh.blockedUntil});
@@ -358,7 +361,7 @@ const xtView = () => ({S: fromXT(xt.reading.session), W: fromXT(xt.reading.weekl
   XL: (xt.reading.scoped || []).map(l => ({...fromXT(l), name: l.name})),
   E: (xt.reading.extras || []).map(l => ({...fromXT(l), name: l.name, used: l.used ?? null, limit: l.limit ?? null})),
   ts: xtoolTakenAt(xt)});
-if (!sub && xtHasData && xt.reading.subscription) sub = xt.reading.subscription;
+if (xtHasData && xt.reading.subscription) sub = xt.reading.subscription;   // same reasoning as the peer's label above
 if (xtHasData && ageOf(xtoolTakenAt(xt)) < SHARED_TTL) {
   const v = xtView();
   writeCache({sub, S: v.S, W: v.W, XL: v.XL, E: v.E, ts: v.ts, blockedUntil: xt.blockedUntil});
