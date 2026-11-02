@@ -235,6 +235,29 @@ function downscale(img,W,W0,SS,H0=W0){
   const out=Buffer.alloc(W0*H0*4),n=SS*SS;
   for(let y=0;y<H0;y++)for(let x=0;x<W0;x++){let r=0,g=0,b=0,a=0;for(let dy=0;dy<SS;dy++)for(let dx=0;dx<SS;dx++){const i=((y*SS+dy)*W+(x*SS+dx))*4,al=img[i+3];r+=img[i]*al;g+=img[i+1]*al;b+=img[i+2]*al;a+=al;}const o=(y*W0+x)*4;out[o]=a?Math.round(r/a):0;out[o+1]=a?Math.round(g/a):0;out[o+2]=a?Math.round(b/a):0;out[o+3]=Math.round(a/n);}
   return png(W0,H0,out).toString('base64');}
+// ---- plan label ----
+// subscriptionType in the Keychain credentials is written at sign-in and goes stale
+// when the plan changes (it still said "max" after an upgrade to Ultra). The profile
+// endpoint's organization.plan_display_label is authoritative, and a plan changes
+// rarely, so it's fetched at most once a day, and only right after a successful
+// usage fetch — never while rate-limited.
+const PLAN_FILE = path.join(os.homedir(), '.config', 'claude-usage-bar', 'plan.json');
+const PLAN_TTL = 86_400_000;
+function cachedPlan(){ try { const o = JSON.parse(fs.readFileSync(PLAN_FILE,'utf8')); if (o?.label) return o; } catch {} return null; }
+async function planLabel(headers){
+  const c = cachedPlan();
+  if (c && ageOf(c.ts) < PLAN_TTL) return c.label;
+  try {
+    const res = await fetch('https://api.anthropic.com/api/oauth/profile', {headers, signal: AbortSignal.timeout(10000)});
+    if (res.ok) {
+      const p = await res.json();
+      const label = (p?.organization?.plan_display_label || '').replace(/\s*plan$/i,'').trim();
+      if (label) { writeAtomic(PLAN_FILE, {label, ts: Date.now()}); return label; }
+    }
+  } catch {}
+  return c?.label || null;   // yesterday's label over none at all
+}
+
 const GREEN=[52,199,89],ORANGE=[255,149,0],RED=[255,59,48];   // macOS systemGreen / Orange / Red
 const rgb=(p,sev)=>(sev==='critical'||p>=90)?RED:(sev==='warning'||p>=70)?ORANGE:GREEN;
 const cd=(iso)=>{if(!iso)return 'n/a';let ms=new Date(iso)-Date.now();if(ms<=0)return 'now';const m=Math.floor(ms/60000),h=Math.floor(m/60);return h>0?`${h}:${String(m%60).padStart(2,'0')}`:`${m}m`;};
@@ -368,11 +391,9 @@ if (!tok) {
   bad('Not signed in — run `claude` then /login, or point this Mac at a hub (~/.config/claude-usage-bar/shared-cache-path)');
 }
 
+const apiHeaders = {Authorization:`Bearer ${tok}`,'anthropic-beta':'oauth-2025-04-20','anthropic-version':'2023-06-01','Accept':'application/json','User-Agent':'claude-cli/usage-bar'};
 try {
-  const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
-    headers: {Authorization:`Bearer ${tok}`,'anthropic-beta':'oauth-2025-04-20','anthropic-version':'2023-06-01','Accept':'application/json','User-Agent':'claude-cli/usage-bar'},
-    signal: AbortSignal.timeout(15000),
-  });
+  const res = await fetch('https://api.anthropic.com/api/oauth/usage', {headers: apiHeaders, signal: AbortSignal.timeout(15000)});
   if (res.status===401||res.status===403) {
     const f = fallback();
     if (f) render(f.S, f.W, f.XL, f.E, `⚠ ${authHint}`);
@@ -391,6 +412,8 @@ try {
     bad('HTTP '+res.status);
   }
   const d = await res.json();
+  // the plan's display name beats the sign-in-time subscriptionType (see planLabel)
+  sub = (await planLabel(apiHeaders)) || sub;
   const lim = Array.isArray(d.limits)?d.limits:[];
   const S = lim.find(l=>l.kind==='session') || (d.five_hour&&{percent:d.five_hour.utilization,resets_at:d.five_hour.resets_at,severity:'normal'});
   const W = lim.find(l=>l.kind==='weekly_all') || (d.seven_day&&{percent:d.seven_day.utilization,resets_at:d.seven_day.resets_at,severity:'normal'});

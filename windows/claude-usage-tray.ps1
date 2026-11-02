@@ -537,6 +537,25 @@ function Update-Bar {
     }
     $d = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/usage' -Headers $headers -TimeoutSec 15
 
+    # subscriptionType is written at sign-in and goes stale when the plan changes (it
+    # still said "max" after an upgrade to Ultra). The profile endpoint's
+    # organization.plan_display_label is authoritative, and a plan changes rarely, so
+    # it's fetched at most once a day, and only right after a successful usage fetch.
+    $planFile = Join-Path $env:USERPROFILE '.config\claude-usage-bar\plan.json'
+    $planLabel = $null; $planFresh = $false
+    try {
+      $pc = Get-Content -Raw -Path $planFile -ErrorAction Stop | ConvertFrom-Json
+      if ($pc.label) { $planLabel = $pc.label; $planFresh = ((Get-Age ([double]$pc.ts)) -lt 86400000) }
+    } catch {}
+    if (-not $planFresh) {
+      try {
+        $prof = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/profile' -Headers $headers -TimeoutSec 10
+        $lbl = (([string]$prof.organization.plan_display_label) -replace '\s*plan$', '').Trim()
+        if ($lbl) { $planLabel = $lbl; Write-Atomic $planFile ([pscustomobject]@{ label = $planLabel; ts = $nowMs }) }
+      } catch {}   # keep yesterday's label over none at all
+    }
+    $subLabel = if ($planLabel) { $planLabel } else { $auth.sub }
+
     $S = $d.limits | Where-Object { $_.kind -eq 'session' }     | Select-Object -First 1
     $W = $d.limits | Where-Object { $_.kind -eq 'weekly_all' }  | Select-Object -First 1
     if (-not $S -and $d.five_hour) { $S = [pscustomobject]@{ percent = $d.five_hour.utilization; resets_at = $d.five_hour.resets_at; severity = 'normal' } }
@@ -568,12 +587,12 @@ function Update-Bar {
     $E = @($E | Sort-Object { [double]$_.percent } -Descending)
 
     # a success clears the cooldown on both caches (blockedUntil simply omitted)
-    Write-Cache ([pscustomobject]@{ sub = $auth.sub; S = $S; W = $W; XL = $XL; E = $E; ts = $nowMs })
+    Write-Cache ([pscustomobject]@{ sub = $subLabel; S = $S; W = $W; XL = $XL; E = $E; ts = $nowMs })
     # Publish for the other machines/apps sharing this account's request budget.
-    Write-Shared ([pscustomobject]@{ v = 1; ts = $nowMs; sub = $auth.sub; S = $S; W = $W; XL = $XL; E = $E })
+    Write-Shared ([pscustomobject]@{ v = 1; ts = $nowMs; sub = $subLabel; S = $S; W = $W; XL = $XL; E = $E })
     # ...and for the tools on this PC, so they reuse this fetch instead of making their own.
-    Write-Atomic $XToolPath ([pscustomobject]@{ reading = (New-XToolReading $S $W $XL $E $auth.sub $nowMs); ts = $nowMs })
-    Render $S $W $XL $E $auth.sub $null
+    Write-Atomic $XToolPath ([pscustomobject]@{ reading = (New-XToolReading $S $W $XL $E $subLabel $nowMs); ts = $nowMs })
+    Render $S $W $XL $E $subLabel $null
   }
   catch {
     $code = $null

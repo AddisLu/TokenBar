@@ -265,6 +265,33 @@ const extraToLimit = (e) => ({
     used: e.used ?? null, limit: e.limit ?? null,
 });
 
+// ---- plan label ----
+// subscriptionType in the credentials file is written at sign-in and goes stale when
+// the plan changes (it still said "max" after an upgrade to Ultra). The profile
+// endpoint's organization.plan_display_label is authoritative, and a plan changes
+// rarely, so it's fetched at most once a day, and only right after a successful
+// usage fetch — never while rate-limited.
+const PLAN_FILE = path.join(os.homedir(), '.config', 'claude-usage-bar', 'plan.json');
+const PLAN_TTL = 86_400_000;
+function cachedPlan() {
+    try { const o = JSON.parse(fs.readFileSync(PLAN_FILE, 'utf8')); if (o?.label) return o; } catch {}
+    return null;
+}
+async function planLabel(headers) {
+    const c = cachedPlan();
+    if (c && ageOf(c.ts) < PLAN_TTL) return c.label;
+    try {
+        const res = await fetch('https://api.anthropic.com/api/oauth/profile',
+            {headers, signal: AbortSignal.timeout(10000)});
+        if (res.ok) {
+            const p = await res.json();
+            const label = (p?.organization?.plan_display_label || '').replace(/\s*plan$/i, '').trim();
+            if (label) { writeAtomic(PLAN_FILE, {label, ts: Date.now()}); return label; }
+        }
+    } catch {}
+    return c?.label || null;   // yesterday's label over none at all
+}
+
 const cache = readCache();
 const sh = await readShared();
 const xt = readXTool();
@@ -322,17 +349,15 @@ if (!tok) {
     out({ok: false, error: 'no-credentials'}); process.exit(0);
 }
 
+const headers = {
+    'Authorization': `Bearer ${tok}`,
+    'anthropic-beta': 'oauth-2025-04-20',
+    'anthropic-version': '2023-06-01',
+    'User-Agent': 'claude-cli/usage-bar',
+    'Accept': 'application/json',
+};
 try {
-    const res = await fetch(URL, {
-        headers: {
-            'Authorization': `Bearer ${tok}`,
-            'anthropic-beta': 'oauth-2025-04-20',
-            'anthropic-version': '2023-06-01',
-            'User-Agent': 'claude-cli/usage-bar',
-            'Accept': 'application/json',
-        },
-        signal: AbortSignal.timeout(15000),
-    });
+    const res = await fetch(URL, {headers, signal: AbortSignal.timeout(15000)});
     if (res.status === 401 || res.status === 403) {
         serveFreshest(authHint);
         out({ok: false, error: 'auth-expired', hint: authHint}); process.exit(0);
@@ -349,6 +374,8 @@ try {
         out({ok: false, error: `http-${res.status}`}); process.exit(0);
     }
     const d = await res.json();
+    // the plan's display name beats the sign-in-time subscriptionType (see planLabel)
+    sub = (await planLabel(headers)) || sub;
 
     let lim = Array.isArray(d.limits) ? d.limits.slice() : [];
     // Fallbacks if the limits[] array is ever absent.

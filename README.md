@@ -240,6 +240,11 @@ account's usage from that reading and never need a token of their own.
 ## Notes
 - **Read-only**: every version only *reads* the credentials file / Keychain — it
   never writes them back, so it can't rotate your token or log you out.
+- The plan name in the dropdown ("Ultra", "Max", …) comes from the profile endpoint's
+  `plan_display_label`, fetched at most once a day after a successful usage fetch and
+  cached in `~/.config/claude-usage-bar/plan.json`. The `subscriptionType` stored in
+  the credentials is only a fallback: it's written at sign-in and goes stale when the
+  plan changes (it still said "max" after an upgrade to Ultra).
 - The `oauth/usage` endpoint is unofficial/internal (it's what Claude Code's `/usage`
   uses); Anthropic may change it.
 - The limits shown apply to Max/Pro subscription accounts. Which kinds exist changes
