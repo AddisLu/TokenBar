@@ -21,13 +21,13 @@ else
     echo "• Plugin folder: $PLUGDIR (from SwiftBar prefs)"
 fi
 
-PLUGIN="$PLUGDIR/claude-usage.180s.sh"
-rm -f "$PLUGDIR/claude-usage.60s.sh" "$PLUGDIR/claude-usage.120s.sh"  # drop older-interval copies so we don't run two
+PLUGIN="$PLUGDIR/claude-usage.60s.sh"
+rm -f "$PLUGDIR/claude-usage.180s.sh" "$PLUGDIR/claude-usage.120s.sh"  # drop older-interval copies so we don't run two
 
 # --- 1. install the plugin ---
 # Copied from the sibling file rather than embedded here, so there is exactly one
 # copy of the plugin source in the repo (same as the Linux/Windows installers).
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-usage.180s.sh"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-usage.60s.sh"
 if [ ! -f "$SRC" ]; then
     echo "!! Cannot find $SRC"
     echo "   Run this script from a checkout of the repo:  cd mac && bash install-claude-usage-mac.sh"

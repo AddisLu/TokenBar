@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # SwiftBar plugin — REAL Claude usage from Anthropic's official endpoint.
+# Runs every 60s (the filename sets SwiftBar's interval); API requests are still
+# throttled to one per 240s, so the faster cycle only matters when reading a hub.
 # Reads the OAuth token from ~/.claude/.credentials.json (Linux) or the macOS
 # Keychain (item "Claude Code-credentials"). Read-only; never writes it back.
 # Draws a graphical progress bar (PNG) to match the Linux GNOME version.
@@ -332,8 +334,11 @@ const coolNote = (ts, wait) => quiet(ts) ? null
   : `⚠ rate-limited — retrying in ${cd(new Date(Date.now()+wait).toISOString())}, cached ${Math.round(ageOf(ts)/1000)}s ago`;
 
 const cache = readCache();
-// Throttle guard: reuse a recent success and don't hit the API.
-if (cache && cache.ts > 0 && ageOf(cache.ts) < THROTTLE_MS) render(cache.S, cache.W, cache.XL, cache.E);
+// Throttle guard: reuse a recent success and don't hit the API. Not when a hub is
+// configured: reading it is a GET on the tailnet, not a request against the account's
+// budget, so every run (SwiftBar's 60s cycle, Refresh) goes straight to the hub and
+// the bar lags the hub's own 5-minute poll by at most a minute.
+if (!isHub(sharedPath()) && cache && cache.ts > 0 && ageOf(cache.ts) < THROTTLE_MS) render(cache.S, cache.W, cache.XL, cache.E);
 
 // Another machine may have already paid for this data — reuse it rather than
 // spending a second request against the shared account-level limit. Its ts is kept

@@ -177,7 +177,7 @@ ntfy app and subscribe to the topic it prints. Change the thresholds with
 ```bash
 cd mac && bash install-claude-usage-mac.sh
 ```
-Installs the SwiftBar plugin (`claude-usage.180s.sh`), adds SwiftBar to Login Items,
+Installs the SwiftBar plugin (`claude-usage.60s.sh`, polled every minute; API calls stay throttled to one per 240 s), adds SwiftBar to Login Items,
 and refreshes. Prereqs: `brew install node`, `brew install --cask swiftbar`, and
 signed in to Claude Code once (token read from the macOS Keychain item
 `Claude Code-credentials`).
